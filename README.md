@@ -61,13 +61,19 @@ your real photos, nudge these numbers and redeploy.
 
 `GET /api/og` returns a PNG. Parameters:
 
-| Param      | Example                                   | Notes                                              |
-|------------|-------------------------------------------|----------------------------------------------------|
-| `sector`   | `PROCUREMENT & SUPPLY CHAIN`              | Shown as the green label. Uppercased automatically. |
-| `title`    | `Interim FP&A Manager`                     | The big title. Green full stop added automatically. |
-| `location` | `Sheffield`                                | Left of the `|`.                                    |
-| `salary`   | `35` / `Competitive` / `15.41 per hour`    | Formatted (see `lib/salary.js`). Blank = Competitive.|
-| `image`    | `auto` / `DSC05135.jpg` / a full `https://…` URL | `auto` (or blank) picks a random background.   |
+| Param             | Example                     | Notes                                                        |
+|-------------------|-----------------------------|--------------------------------------------------------------|
+| `division`        | `Accountancy & Finance`     | Green line. If `Engineering & Manufacturing`, split by consultant. |
+| `consultant`      | `Chris Ridgway`             | Only used to split the combined division. Also name the email. |
+| `title`           | `Group Financial Accountant`| Green full stop added automatically.                         |
+| `location`        | `West Yorkshire`            | First segment of the info line.                              |
+| `salary_from`     | `90000`                     | Formatted to `£90k`.                                          |
+| `salary_to`       | `110000`                    | Range becomes `£90k - £110k`.                                 |
+| `hide_salary`     | `yes` / `no`                | `yes` shows `£Competitive`.                                   |
+| `employment_type` | `Contract` / `Permanent` / `Temporary` | Adds a 3rd segment for Contract/Temporary.        |
+| `working_pattern` | `Full-time` / `Part-time`   | Adds a 3rd segment for Part-time.                            |
+| `image`           | `auto`                      | `auto` picks a random background.                            |
+| `token`           | secret                      | If `SHARE_TOKEN` is set in Vercel.                          |
 
 **Example:**
 

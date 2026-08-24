@@ -1,5 +1,5 @@
 import { ImageResponse } from "next/og";
-import { GREEN, PHOTO_BASE_URL, BACKGROUNDS } from "../../../lib/config";
+import { GREEN, PHOTO_BASE_URL, BACKGROUNDS, resolveDivision, resolveType } from "../../../lib/config";
 import { formatSalary } from "../../../lib/salary";
 
 export const runtime = "edge";
@@ -41,12 +41,23 @@ export async function GET(req) {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  const sector = (searchParams.get("sector") || "").toUpperCase();
+  const rawDivision = searchParams.get("division") || searchParams.get("sector") || "";
+  const consultant = searchParams.get("consultant") || "";
+  const sector = resolveDivision(rawDivision, consultant).toUpperCase();
   const title = (searchParams.get("title") || "Job Title").trim();
   const location = (searchParams.get("location") || "").trim();
-  const salary = formatSalary(searchParams.get("salary"));
+  const salary = formatSalary({
+    from: searchParams.get("salary_from"),
+    to: searchParams.get("salary_to"),
+    period: searchParams.get("salary_period"),
+    hide: searchParams.get("hide_salary"),
+  });
+  const typeLabel = resolveType(
+    searchParams.get("employment_type"),
+    searchParams.get("working_pattern")
+  );
   const bg = pickBackground(origin, searchParams.get("image"));
-  const locSalary = [location, salary].filter(Boolean).join(" | ");
+  const locSalary = [location, salary, typeLabel].filter(Boolean).join(" | ");
 
   const [bold, semiBold] = await Promise.all([
     fetch(new URL("../../fonts/Area-Bold.otf", import.meta.url)).then((r) => r.arrayBuffer()),
