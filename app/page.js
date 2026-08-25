@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { SECTORS, BACKGROUNDS, COMBINED_DIVISION } from "../lib/config";
+import { SECTORS, BACKGROUNDS } from "../lib/config";
 
 const GREEN = "#93BF20";
 
@@ -58,7 +58,7 @@ export default function Home() {
   const row = { marginBottom: "14px" };
   const half = { display: "flex", gap: "10px" };
 
-  const divisionOptions = Array.from(new Set([...SECTORS, COMBINED_DIVISION]));
+  const divisionOptions = SECTORS;
 
   return (
     <main style={{ maxWidth: "1000px", margin: "0 auto", padding: "40px 24px 80px" }}>
@@ -75,12 +75,10 @@ export default function Home() {
             </select>
           </div>
 
-          {division.toUpperCase() === COMBINED_DIVISION && (
-            <div style={row}>
-              <label style={label}>Posting consultant (decides Engineering vs Manufacturing)</label>
-              <input style={field} value={consultant} onChange={(e) => setConsultant(e.target.value)} placeholder="e.g. Chris Ridgway" />
-            </div>
-          )}
+          <div style={row}>
+            <label style={label}>Posting consultant (some names override the division shown)</label>
+            <input style={field} value={consultant} onChange={(e) => setConsultant(e.target.value)} placeholder="e.g. Frankie Parker" />
+          </div>
 
           <div style={row}>
             <label style={label}>Job title</label>

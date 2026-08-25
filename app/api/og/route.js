@@ -1,6 +1,6 @@
 import { ImageResponse } from "next/og";
 import { GREEN, PHOTO_BASE_URL, BACKGROUNDS, resolveDivision, resolveType } from "../../../lib/config";
-import { formatSalary } from "../../../lib/salary";
+import { formatSalary, parseRange } from "../../../lib/salary";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -46,10 +46,17 @@ export async function GET(req) {
   const sector = resolveDivision(rawDivision, consultant).toUpperCase();
   const title = (searchParams.get("title") || "Job Title").trim();
   const location = (searchParams.get("location") || "").trim();
+  let sFrom = searchParams.get("salary_from");
+  let sTo = searchParams.get("salary_to");
+  const salaryRaw = searchParams.get("salary");
+  if (!sFrom && !sTo && salaryRaw) {
+    const r = parseRange(salaryRaw);
+    sFrom = r.from; sTo = r.to;
+  }
   const salary = formatSalary({
-    from: searchParams.get("salary_from"),
-    to: searchParams.get("salary_to"),
-    period: searchParams.get("salary_period"),
+    from: sFrom,
+    to: sTo,
+    period: searchParams.get("salary_period") || salaryRaw,
     hide: searchParams.get("hide_salary"),
   });
   const typeLabel = resolveType(
