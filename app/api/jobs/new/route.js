@@ -9,23 +9,23 @@ const AUTH_PATH = "/api/Auth/ExchangeToken";
 const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 
 // ---------------------------------------------------------------------------
-// Confirmed behaviour of Tracker's PagedSearch, from probing:
+// Tracker's PagedSearch, as established by probing:
 //   - honours publishOnline, state and updatedAfter
 //   - IGNORES pageSize (always 10) and any sort parameters
-//   - wraps results in "opportunities", with totalCount / hasNextPage alongside
+//   - wraps results in "opportunities" with totalCount / hasNextPage alongside
 //
-// publishOnline:true alone returns 1,154 records (all history). Adding
-// state:"open" cuts that to ~160. Since we cannot sort, we also limit by date
-// so the set stays small enough to page through quickly.
+// We ask for open, published jobs touched recently, then narrow to the ones
+// actually PUBLISHED recently. Those are two different things: a job published
+// in July can be updated today, and that is not a new advert.
 // ---------------------------------------------------------------------------
-const DAYS_BACK = 7;        // how far back to look; override with ?days=N
-const MAX_PAGES = 12;       // safety valve — 120 records
+const UPDATED_WITHIN_DAYS = 14;   // how far back to trawl; ?days=N
+const PUBLISHED_WITHIN_DAYS = 3;  // what counts as a new advert; ?pubdays=N
+const MAX_PAGES = 15;
 const MAX_JOBS = 25;
 const MAX_DETAIL_FETCHES = 30;
 
 function daysAgoISO(days) {
-  const d = new Date(Date.now() - days * 86400000);
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+  return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
 }
 
 function extractJwt(data) {
@@ -72,29 +72,19 @@ function asList(data) {
   return (data && (data.opportunities || data.data || data.results || data.items)) || [];
 }
 
-// Walk the pages until Tracker says there are no more, or we hit the cap.
 async function fetchAllPages(jwt, baseBody) {
   const all = [];
   let page = 1;
   let meta = {};
-
   while (page <= MAX_PAGES) {
     const r = await postJson(jwt, PAGED_SEARCH_PATH, { ...baseBody, pageNumber: page });
     if (!r.ok) break;
-
     const list = asList(r.data);
     all.push(...list);
-    meta = {
-      totalCount: r.data && r.data.totalCount,
-      totalPages: r.data && r.data.totalPages,
-      pagesFetched: page,
-    };
-
-    const hasNext = r.data && r.data.hasNextPage;
-    if (!hasNext || list.length === 0) break;
+    meta = { totalCount: r.data && r.data.totalCount, pagesFetched: page };
+    if (!(r.data && r.data.hasNextPage) || list.length === 0) break;
     page += 1;
   }
-
   return { list: all, meta };
 }
 
@@ -108,10 +98,6 @@ async function getOpportunity(jwt, id) {
   try { return JSON.parse(text); } catch { return null; }
 }
 
-function shallowDate(o) {
-  return String(o.publishDate || o.lastUpdatedDateTime || o.creationDate || "");
-}
-
 export async function GET(req) {
   const url = new URL(req.url);
   const token = process.env.SHARE_TOKEN;
@@ -121,7 +107,8 @@ export async function GET(req) {
 
   const jobId = url.searchParams.get("job");
   const wantList = url.searchParams.get("list") === "1";
-  const days = parseInt(url.searchParams.get("days") || "", 10) || DAYS_BACK;
+  const days = parseInt(url.searchParams.get("days") || "", 10) || UPDATED_WITHIN_DAYS;
+  const pubDays = parseInt(url.searchParams.get("pubdays") || "", 10) || PUBLISHED_WITHIN_DAYS;
 
   let jwt;
   try {
@@ -157,15 +144,23 @@ export async function GET(req) {
 
   const { list: shallow, meta } = await fetchAllPages(jwt, query);
 
+  // Narrow to jobs actually published recently. A job updated today but
+  // published in July is not a new advert.
+  const publishedCutoff = daysAgoISO(pubDays);
+  const recent = shallow
+    .filter((o) => String(o.publishDate || "") >= publishedCutoff)
+    .sort((a, b) => String(b.publishDate || "").localeCompare(String(a.publishDate || "")));
+
   if (wantList) {
     return new Response(JSON.stringify({
       query,
+      publishedOnOrAfter: publishedCutoff,
       ...meta,
-      returned: shallow.length,
-      rows: shallow.map((o) => ({
+      matchedUpdateWindow: shallow.length,
+      matchedPublishWindow: recent.length,
+      rows: recent.map((o) => ({
         id: o.opportunityId || o.id,
         title: o.publishTitle || o.opportunityName || o.name,
-        online: o.publishOnline,
         status: o.opportunityStatusDesc,
         publishDate: o.publishDate,
         updated: o.lastUpdatedDateTime,
@@ -173,13 +168,7 @@ export async function GET(req) {
     }, null, 2), { headers: { "content-type": "application/json" } });
   }
 
-  const ids = shallow
-    .slice()
-    .sort((a, b) => shallowDate(b).localeCompare(shallowDate(a)))
-    .map((o) => o.opportunityId || o.id)
-    .filter(Boolean)
-    .slice(0, MAX_DETAIL_FETCHES);
-
+  const ids = recent.map((o) => o.opportunityId || o.id).filter(Boolean).slice(0, MAX_DETAIL_FETCHES);
   const details = await Promise.all(ids.map((id) => getOpportunity(jwt, id)));
 
   const origin = url.origin;
@@ -200,11 +189,13 @@ export async function GET(req) {
       base.set("image", "auto");
       if (token) base.set("token", token);
 
+      // Version A: the salary as Tracker holds it.
       const withSalary = new URLSearchParams(base);
       if (f.salaryFrom != null && f.salaryFrom !== "") withSalary.set("salary_from", String(f.salaryFrom));
       if (f.salaryTo != null && f.salaryTo !== "") withSalary.set("salary_to", String(f.salaryTo));
       if (f.salaryPeriod) withSalary.set("salary_period", f.salaryPeriod);
 
+      // Version B: "Competitive" instead, for jobs where the salary is withheld.
       const competitive = new URLSearchParams(base);
       competitive.set("salary_text", COMPETITIVE_LABEL);
 
