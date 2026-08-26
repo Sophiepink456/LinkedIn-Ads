@@ -8,13 +8,20 @@ const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.c
 const AUTH_PATH = "/api/Auth/ExchangeToken";
 const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 
-// Tracker's PagedSearch honours publishOnline, state and updatedAfter, ignores
-// pageSize and sorting, and wraps results in "opportunities".
+// ---------------------------------------------------------------------------
+// Tracker's PagedSearch honours state and updatedAfter, ignores pageSize
+// (always 10) and all sort parameters, and nests results under "opportunities".
+//
+// NOTE: publishOnline is deliberately NOT used to filter. Jobs appear on the
+// Elevation website with publishOnline set to false — confirmed on several
+// records — so filtering on it dropped live vacancies. Each job's advertStatus
+// is checked instead, after the full record is fetched.
+// ---------------------------------------------------------------------------
 const UPDATED_WITHIN_DAYS = 14;
 const PUBLISHED_WITHIN_DAYS = 3;
-const MAX_PAGES = 15;
+const MAX_PAGES = 30;
 const MAX_JOBS = 25;
-const MAX_DETAIL_FETCHES = 30;
+const MAX_DETAIL_FETCHES = 40;
 
 function daysAgoISO(days) {
   return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
@@ -128,8 +135,8 @@ export async function GET(req) {
     });
   }
 
+  // No publishOnline filter — see the note at the top of this file.
   const query = {
-    publishOnline: true,
     state: "open",
     updatedAfter: daysAgoISO(days),
   };
@@ -152,6 +159,8 @@ export async function GET(req) {
         id: o.opportunityId || o.id,
         title: o.publishTitle || o.opportunityName || o.name,
         status: o.opportunityStatusDesc,
+        advertStatus: o.advertStatus,
+        publishOnline: o.publishOnline,
         publishDate: o.publishDate,
       })),
     }, null, 2), { headers: { "content-type": "application/json" } });
@@ -165,18 +174,16 @@ export async function GET(req) {
   const jobs = details
     .filter(Boolean)
     .map((opp) => mapOpportunity(opp))
+    // advertStatus "A" means the advert is live. Filled or closed jobs are out
+    // regardless.
     .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
-    // Parkinson Lee is a separate company — no ads for its roles.
     .filter((f) => !isExcludedDepartment(f.department))
     .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
     .slice(0, MAX_JOBS)
     .map((f) => {
-      // Resolved here as well as in the renderer, so the feed can flag any job
-      // whose division could not be worked out.
       const division = resolveDivision(f.department, f.consultant);
 
       const base = new URLSearchParams();
-      // Send the department; the renderer resolves it the same way.
       if (f.department) base.set("division", f.department);
       if (f.consultant) base.set("consultant", f.consultant);
       if (f.title) base.set("title", f.title);
@@ -197,17 +204,18 @@ export async function GET(req) {
         id: f.id,
         title: f.title,
         consultant: f.consultant,
+        // Ready for when the emails go to consultants rather than to you.
+        consultantEmail: f.consultantEmail,
         consultantSource: f.consultantSource,
         department: f.department,
         division,
-        // Flags a job whose consultant is not on the division list, so the ad
-        // would go out with no division line.
         needsReview: !division && String(f.department || "").toUpperCase() !== "INTERNAL OFFICE",
         location: f.location,
         client: f.client,
         reference: f.reference,
         publishDate: f.publishDate,
         status: f.status,
+        advertStatus: f.advertStatus,
         imageUrl: origin + "/api/og?" + withSalary.toString(),
         imageUrlCompetitive: origin + "/api/og?" + competitive.toString(),
       };
