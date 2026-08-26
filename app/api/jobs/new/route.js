@@ -35,6 +35,18 @@ async function getJwt() {
   return jwt;
 }
 
+// Fetch one opportunity in full. Single-record endpoints usually return more
+// than search results do — custom fields in particular.
+async function getOpportunity(jwt, id) {
+  const res = await fetch(TRACKER_BASE + "/api/v1/Opportunity/" + encodeURIComponent(id), {
+    method: "GET",
+    headers: { Authorization: "Bearer " + jwt },
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error("Get opportunity " + id + " failed (" + res.status + "): " + text.slice(0, 400));
+  try { return JSON.parse(text); } catch { return text; }
+}
+
 async function searchOpportunities(jwt) {
   const res = await fetch(TRACKER_BASE + SEARCH_PATH, {
     method: "POST",
@@ -56,13 +68,38 @@ export async function GET(req) {
     return new Response("Unauthorized", { status: 401 });
   }
 
+  const jobId = url.searchParams.get("job");
   const wantDebug = url.searchParams.get("debug") === "1";
   const wantFields = url.searchParams.get("fields") === "1";
   const showAll = url.searchParams.get("all") === "1";
 
+  let jwt;
+  try {
+    jwt = await getJwt();
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // ?job=51401 — dump one opportunity in full. This is how we find out what a
+  // genuinely live, published job looks like, and whether custom fields come
+  // back on the single-record endpoint.
+  if (jobId) {
+    try {
+      const opp = await getOpportunity(jwt, jobId);
+      return new Response(JSON.stringify(opp, null, 2), {
+        headers: { "content-type": "application/json" },
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
+        status: 502, headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
   let list;
   try {
-    const jwt = await getJwt();
     list = await searchOpportunities(jwt);
   } catch (e) {
     return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
@@ -76,9 +113,6 @@ export async function GET(req) {
     });
   }
 
-  // ?fields=1 — a compact table of every job's salary-related fields, for
-  // comparing against what the website actually prints. This is how we find
-  // out which field carries the "hide salary" decision.
   if (wantFields) {
     const rows = list.map((o) => ({
       id: o.opportunityId,
@@ -91,7 +125,6 @@ export async function GET(req) {
       salaryPer: o.publishSalaryPer,
       rate: o.opportunityRate,
       benefits: o.publishBenefits,
-      currency: o.currencyCode,
     }));
     return new Response(JSON.stringify({ count: rows.length, rows }, null, 2), {
       headers: { "content-type": "application/json" },
@@ -111,20 +144,17 @@ export async function GET(req) {
       if (f.consultant) p.set("consultant", f.consultant);
       if (f.title) p.set("title", f.title);
       if (f.location) p.set("location", f.location);
-
       if (!f.hideSalary) {
         if (f.salaryFrom != null && f.salaryFrom !== "") p.set("salary_from", String(f.salaryFrom));
         if (f.salaryTo != null && f.salaryTo !== "") p.set("salary_to", String(f.salaryTo));
         if (f.salaryPeriod) p.set("salary_period", f.salaryPeriod);
       }
-
       if (f.employmentType) p.set("employment_type", f.employmentType);
-      if (f.workingPattern) p.set("working_pattern", f.workingPattern);
       p.set("image", "auto");
       if (token) p.set("token", token);
 
       return {
-        id: String(opp.opportunityId || opp.advertId || ""),
+        id: String(opp.opportunityId || ""),
         title: f.title,
         consultant: f.consultant,
         division: f.division,
