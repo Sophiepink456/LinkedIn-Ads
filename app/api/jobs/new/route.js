@@ -8,8 +8,13 @@ const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.c
 const AUTH_PATH = "/api/Auth/ExchangeToken";
 const SEARCH_PATH = "/api/v1/Opportunity/Search";
 const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
+
 const MAX_JOBS = 25;
 const MAX_DETAIL_FETCHES = 30;
+
+// Confirmed by probing: PagedSearch honours publishOnline and wraps its
+// results in an "opportunities" key, with paging metadata alongside.
+const LIVE_QUERY = { publishOnline: true, pageNumber: 1, pageSize: 100 };
 
 function extractJwt(data) {
   if (!data) return null;
@@ -50,9 +55,11 @@ async function postJson(jwt, path, body) {
   return { ok: res.ok, status: res.status, text, data };
 }
 
+// PagedSearch nests results under "opportunities". Plain Search returns a bare
+// array. Handle both.
 function asList(data) {
   if (Array.isArray(data)) return data;
-  return (data && (data.data || data.results || data.items || data.records)) || [];
+  return (data && (data.opportunities || data.data || data.results || data.items || data.records)) || [];
 }
 
 async function getOpportunity(jwt, id) {
@@ -65,31 +72,25 @@ async function getOpportunity(jwt, id) {
   try { return JSON.parse(text); } catch { return null; }
 }
 
-// The search endpoint's parameters are undocumented. This tries the realistic
-// shapes and reports what each returns, so we can see which ones the API
-// actually honours instead of guessing.
+function shallowDate(o) {
+  return String(o.publishDate || o.lastUpdatedDateTime || o.creationDate || "");
+}
+
+// Focused probe: now that PagedSearch is understood, work out how many live
+// jobs there are and whether sorting is honoured.
 const PROBE_BODIES = [
-  { label: "empty", path: SEARCH_PATH, body: {} },
-  { label: "pageNumber/pageSize", path: SEARCH_PATH, body: { pageNumber: 1, pageSize: 100 } },
-  { label: "pageNum/numRecords", path: SEARCH_PATH, body: { pageNum: 0, numRecords: 100 } },
-  { label: "page/pageSize", path: SEARCH_PATH, body: { page: 1, pageSize: 100 } },
-  { label: "sort publishDate desc", path: SEARCH_PATH, body: { sortField: "publishDate", sortDir: "desc" } },
-  { label: "sort lastUpdated desc", path: SEARCH_PATH, body: { sortField: "lastUpdatedDateTime", sortDir: "desc" } },
-  { label: "publishOnline true", path: SEARCH_PATH, body: { publishOnline: true } },
-  { label: "state open", path: SEARCH_PATH, body: { state: "open" } },
-  { label: "status open", path: SEARCH_PATH, body: { status: "Open" } },
-  { label: "includeCustomFields", path: SEARCH_PATH, body: { includeCustomFields: true } },
-  { label: "updatedAfter 2026-08-01", path: SEARCH_PATH, body: { updatedAfter: "2026-08-01" } },
-  { label: "searchText blank", path: SEARCH_PATH, body: { searchText: "" } },
-  { label: "PagedSearch empty", path: PAGED_SEARCH_PATH, body: {} },
-  { label: "PagedSearch page 1 size 100", path: PAGED_SEARCH_PATH, body: { pageNumber: 1, pageSize: 100 } },
-  { label: "PagedSearch pageNum 0", path: PAGED_SEARCH_PATH, body: { pageNum: 0, numRecords: 100 } },
+  { label: "paged: publishOnline true", body: { publishOnline: true, pageNumber: 1, pageSize: 100 } },
+  { label: "paged: publishOnline + state open", body: { publishOnline: true, state: "open", pageNumber: 1, pageSize: 100 } },
+  { label: "paged: sort publishDate desc", body: { publishOnline: true, sortField: "publishDate", sortDir: "desc", pageNumber: 1, pageSize: 100 } },
+  { label: "paged: sort lastUpdated desc", body: { publishOnline: true, sortField: "lastUpdatedDateTime", sortDir: "desc", pageNumber: 1, pageSize: 100 } },
+  { label: "paged: updatedAfter 2026-08-01", body: { publishOnline: true, updatedAfter: "2026-08-01", pageNumber: 1, pageSize: 100 } },
+  { label: "paged: pageSize 5 (is it honoured?)", body: { publishOnline: true, pageNumber: 1, pageSize: 5 } },
 ];
 
 async function runProbe(jwt) {
   const results = [];
   for (const p of PROBE_BODIES) {
-    const r = await postJson(jwt, p.path, p.body);
+    const r = await postJson(jwt, PAGED_SEARCH_PATH, p.body);
     if (!r.ok) {
       results.push({ tried: p.label, status: r.status, error: r.text.slice(0, 200) });
       continue;
@@ -97,11 +98,12 @@ async function runProbe(jwt) {
     const list = asList(r.data);
     results.push({
       tried: p.label,
-      status: r.status,
-      count: list.length,
-      firstTitle: list[0] ? (list[0].publishTitle || list[0].opportunityName || list[0].name || "?") : null,
-      lastTitle: list.length > 1 ? (list[list.length - 1].publishTitle || list[list.length - 1].opportunityName || list[list.length - 1].name || "?") : null,
-      keys: r.data && !Array.isArray(r.data) ? Object.keys(r.data).slice(0, 12) : undefined,
+      returned: list.length,
+      totalCount: r.data && r.data.totalCount,
+      totalPages: r.data && r.data.totalPages,
+      pageSizeEcho: r.data && r.data.pageSize,
+      first: list[0] ? { title: list[0].publishTitle || list[0].opportunityName || list[0].name, date: shallowDate(list[0]), online: list[0].publishOnline } : null,
+      last: list.length > 1 ? { title: list[list.length - 1].publishTitle || list[list.length - 1].opportunityName || list[list.length - 1].name, date: shallowDate(list[list.length - 1]) } : null,
     });
   }
   return results;
@@ -116,6 +118,7 @@ export async function GET(req) {
 
   const jobId = url.searchParams.get("job");
   const wantProbe = url.searchParams.get("probe") === "1";
+  const wantList = url.searchParams.get("list") === "1";
 
   let jwt;
   try {
@@ -126,7 +129,6 @@ export async function GET(req) {
     });
   }
 
-  // ?job=44469 — dump one opportunity in full.
   if (jobId) {
     const opp = await getOpportunity(jwt, jobId);
     if (!opp) {
@@ -144,7 +146,6 @@ export async function GET(req) {
     });
   }
 
-  // ?probe=1 — work out which search parameters the API honours.
   if (wantProbe) {
     const results = await runProbe(jwt);
     return new Response(JSON.stringify({ results }, null, 2), {
@@ -152,8 +153,16 @@ export async function GET(req) {
     });
   }
 
-  // --- Normal feed ---------------------------------------------------------
-  const search = await postJson(jwt, SEARCH_PATH, {});
+  // --- Fetch the live jobs -------------------------------------------------
+  let search = await postJson(jwt, PAGED_SEARCH_PATH, LIVE_QUERY);
+  let usedEndpoint = "PagedSearch";
+
+  // Fall back to plain Search if PagedSearch ever misbehaves.
+  if (!search.ok || asList(search.data).length === 0) {
+    search = await postJson(jwt, SEARCH_PATH, { publishOnline: true });
+    usedEndpoint = "Search (fallback)";
+  }
+
   if (!search.ok) {
     return new Response(JSON.stringify({ error: "Search failed (" + search.status + "): " + search.text.slice(0, 300) }, null, 2), {
       status: 502, headers: { "content-type": "application/json" },
@@ -162,8 +171,32 @@ export async function GET(req) {
 
   const shallow = asList(search.data);
 
-  // The search results are too thin to judge, so fetch each record in full.
-  const ids = shallow.map((o) => o.opportunityId || o.id).filter(Boolean).slice(0, MAX_DETAIL_FETCHES);
+  // ?list=1 — the shallow list before any detail fetching, for checking what
+  // the search actually returned.
+  if (wantList) {
+    return new Response(JSON.stringify({
+      endpoint: usedEndpoint,
+      returned: shallow.length,
+      totalCount: search.data && search.data.totalCount,
+      rows: shallow.map((o) => ({
+        id: o.opportunityId || o.id,
+        title: o.publishTitle || o.opportunityName || o.name,
+        online: o.publishOnline,
+        status: o.opportunityStatusDesc,
+        publishDate: o.publishDate,
+      })),
+    }, null, 2), { headers: { "content-type": "application/json" } });
+  }
+
+  // Newest first, then fetch the full record for each — the search results are
+  // too thin to build an ad from.
+  const ids = shallow
+    .slice()
+    .sort((a, b) => shallowDate(b).localeCompare(shallowDate(a)))
+    .map((o) => o.opportunityId || o.id)
+    .filter(Boolean)
+    .slice(0, MAX_DETAIL_FETCHES);
+
   const details = await Promise.all(ids.map((id) => getOpportunity(jwt, id)));
 
   const origin = url.origin;
@@ -184,15 +217,11 @@ export async function GET(req) {
       base.set("image", "auto");
       if (token) base.set("token", token);
 
-      // Version A — the salary as Tracker holds it.
       const withSalary = new URLSearchParams(base);
       if (f.salaryFrom != null && f.salaryFrom !== "") withSalary.set("salary_from", String(f.salaryFrom));
       if (f.salaryTo != null && f.salaryTo !== "") withSalary.set("salary_to", String(f.salaryTo));
       if (f.salaryPeriod) withSalary.set("salary_period", f.salaryPeriod);
 
-      // Version B — "Competitive" in place of the figures, for jobs where the
-      // salary is being withheld. Tracker's API does not expose the hide-salary
-      // tickbox, so both are sent and a human picks.
       const competitive = new URLSearchParams(base);
       competitive.set("salary_text", COMPETITIVE_LABEL);
 
