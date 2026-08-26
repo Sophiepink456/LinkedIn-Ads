@@ -1,4 +1,5 @@
 import { mapOpportunity } from "../../../../lib/mapping";
+import { COMPETITIVE_LABEL } from "../../../../lib/config";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -6,7 +7,9 @@ export const dynamic = "force-dynamic";
 const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.com";
 const AUTH_PATH = "/api/Auth/ExchangeToken";
 const SEARCH_PATH = "/api/v1/Opportunity/Search";
+const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 const MAX_JOBS = 25;
+const MAX_DETAIL_FETCHES = 30;
 
 function extractJwt(data) {
   if (!data) return null;
@@ -35,30 +38,73 @@ async function getJwt() {
   return jwt;
 }
 
-// Fetch one opportunity in full. Single-record endpoints usually return more
-// than search results do — custom fields in particular.
+async function postJson(jwt, path, body) {
+  const res = await fetch(TRACKER_BASE + path, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* leave null */ }
+  return { ok: res.ok, status: res.status, text, data };
+}
+
+function asList(data) {
+  if (Array.isArray(data)) return data;
+  return (data && (data.data || data.results || data.items || data.records)) || [];
+}
+
 async function getOpportunity(jwt, id) {
   const res = await fetch(TRACKER_BASE + "/api/v1/Opportunity/" + encodeURIComponent(id), {
     method: "GET",
     headers: { Authorization: "Bearer " + jwt },
   });
+  if (!res.ok) return null;
   const text = await res.text();
-  if (!res.ok) throw new Error("Get opportunity " + id + " failed (" + res.status + "): " + text.slice(0, 400));
-  try { return JSON.parse(text); } catch { return text; }
+  try { return JSON.parse(text); } catch { return null; }
 }
 
-async function searchOpportunities(jwt) {
-  const res = await fetch(TRACKER_BASE + SEARCH_PATH, {
-    method: "POST",
-    headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error("Opportunity search failed (" + res.status + "): " + text.slice(0, 500));
-  let data;
-  try { data = JSON.parse(text); } catch { data = null; }
-  if (Array.isArray(data)) return data;
-  return (data && (data.data || data.results || data.items)) || [];
+// The search endpoint's parameters are undocumented. This tries the realistic
+// shapes and reports what each returns, so we can see which ones the API
+// actually honours instead of guessing.
+const PROBE_BODIES = [
+  { label: "empty", path: SEARCH_PATH, body: {} },
+  { label: "pageNumber/pageSize", path: SEARCH_PATH, body: { pageNumber: 1, pageSize: 100 } },
+  { label: "pageNum/numRecords", path: SEARCH_PATH, body: { pageNum: 0, numRecords: 100 } },
+  { label: "page/pageSize", path: SEARCH_PATH, body: { page: 1, pageSize: 100 } },
+  { label: "sort publishDate desc", path: SEARCH_PATH, body: { sortField: "publishDate", sortDir: "desc" } },
+  { label: "sort lastUpdated desc", path: SEARCH_PATH, body: { sortField: "lastUpdatedDateTime", sortDir: "desc" } },
+  { label: "publishOnline true", path: SEARCH_PATH, body: { publishOnline: true } },
+  { label: "state open", path: SEARCH_PATH, body: { state: "open" } },
+  { label: "status open", path: SEARCH_PATH, body: { status: "Open" } },
+  { label: "includeCustomFields", path: SEARCH_PATH, body: { includeCustomFields: true } },
+  { label: "updatedAfter 2026-08-01", path: SEARCH_PATH, body: { updatedAfter: "2026-08-01" } },
+  { label: "searchText blank", path: SEARCH_PATH, body: { searchText: "" } },
+  { label: "PagedSearch empty", path: PAGED_SEARCH_PATH, body: {} },
+  { label: "PagedSearch page 1 size 100", path: PAGED_SEARCH_PATH, body: { pageNumber: 1, pageSize: 100 } },
+  { label: "PagedSearch pageNum 0", path: PAGED_SEARCH_PATH, body: { pageNum: 0, numRecords: 100 } },
+];
+
+async function runProbe(jwt) {
+  const results = [];
+  for (const p of PROBE_BODIES) {
+    const r = await postJson(jwt, p.path, p.body);
+    if (!r.ok) {
+      results.push({ tried: p.label, status: r.status, error: r.text.slice(0, 200) });
+      continue;
+    }
+    const list = asList(r.data);
+    results.push({
+      tried: p.label,
+      status: r.status,
+      count: list.length,
+      firstTitle: list[0] ? (list[0].publishTitle || list[0].opportunityName || list[0].name || "?") : null,
+      lastTitle: list.length > 1 ? (list[list.length - 1].publishTitle || list[list.length - 1].opportunityName || list[list.length - 1].name || "?") : null,
+      keys: r.data && !Array.isArray(r.data) ? Object.keys(r.data).slice(0, 12) : undefined,
+    });
+  }
+  return results;
 }
 
 export async function GET(req) {
@@ -69,9 +115,7 @@ export async function GET(req) {
   }
 
   const jobId = url.searchParams.get("job");
-  const wantDebug = url.searchParams.get("debug") === "1";
-  const wantFields = url.searchParams.get("fields") === "1";
-  const showAll = url.searchParams.get("all") === "1";
+  const wantProbe = url.searchParams.get("probe") === "1";
 
   let jwt;
   try {
@@ -82,88 +126,89 @@ export async function GET(req) {
     });
   }
 
-  // ?job=51401 — dump one opportunity in full. This is how we find out what a
-  // genuinely live, published job looks like, and whether custom fields come
-  // back on the single-record endpoint.
+  // ?job=44469 — dump one opportunity in full.
   if (jobId) {
-    try {
-      const opp = await getOpportunity(jwt, jobId);
-      return new Response(JSON.stringify(opp, null, 2), {
-        headers: { "content-type": "application/json" },
-      });
-    } catch (e) {
-      return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
-        status: 502, headers: { "content-type": "application/json" },
+    const opp = await getOpportunity(jwt, jobId);
+    if (!opp) {
+      return new Response(JSON.stringify({ error: "No record found for id " + jobId }, null, 2), {
+        status: 404, headers: { "content-type": "application/json" },
       });
     }
+    if (url.searchParams.get("mapped") === "1") {
+      return new Response(JSON.stringify(mapOpportunity(opp), null, 2), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify(opp, null, 2), {
+      headers: { "content-type": "application/json" },
+    });
   }
 
-  let list;
-  try {
-    list = await searchOpportunities(jwt);
-  } catch (e) {
-    return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
+  // ?probe=1 — work out which search parameters the API honours.
+  if (wantProbe) {
+    const results = await runProbe(jwt);
+    return new Response(JSON.stringify({ results }, null, 2), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // --- Normal feed ---------------------------------------------------------
+  const search = await postJson(jwt, SEARCH_PATH, {});
+  if (!search.ok) {
+    return new Response(JSON.stringify({ error: "Search failed (" + search.status + "): " + search.text.slice(0, 300) }, null, 2), {
       status: 502, headers: { "content-type": "application/json" },
     });
   }
 
-  if (wantDebug) {
-    return new Response(JSON.stringify({ count: list.length, sample: list.slice(0, 2) }, null, 2), {
-      headers: { "content-type": "application/json" },
-    });
-  }
+  const shallow = asList(search.data);
 
-  if (wantFields) {
-    const rows = list.map((o) => ({
-      id: o.opportunityId,
-      ref: o.publishReference || "",
-      title: (o.publishTitle || o.opportunityName || "").trim(),
-      online: o.publishOnline,
-      status: o.opportunityStatusDesc,
-      salaryFrom: o.publishSalaryFrom,
-      salaryTo: o.publishSalaryTo,
-      salaryPer: o.publishSalaryPer,
-      rate: o.opportunityRate,
-      benefits: o.publishBenefits,
-    }));
-    return new Response(JSON.stringify({ count: rows.length, rows }, null, 2), {
-      headers: { "content-type": "application/json" },
-    });
-  }
+  // The search results are too thin to judge, so fetch each record in full.
+  const ids = shallow.map((o) => o.opportunityId || o.id).filter(Boolean).slice(0, MAX_DETAIL_FETCHES);
+  const details = await Promise.all(ids.map((id) => getOpportunity(jwt, id)));
 
   const origin = url.origin;
 
-  const jobs = list
-    .map((opp) => ({ opp, f: mapOpportunity(opp) }))
-    .filter((x) => showAll || (x.f.advertised && x.f.active && !x.f.dead && x.f.title))
-    .sort((a, b) => String(b.f.publishDate).localeCompare(String(a.f.publishDate)))
+  const jobs = details
+    .filter(Boolean)
+    .map((opp) => mapOpportunity(opp))
+    .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
+    .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
     .slice(0, MAX_JOBS)
-    .map(({ opp, f }) => {
-      const p = new URLSearchParams();
-      if (f.division) p.set("division", f.division);
-      if (f.consultant) p.set("consultant", f.consultant);
-      if (f.title) p.set("title", f.title);
-      if (f.location) p.set("location", f.location);
-      if (!f.hideSalary) {
-        if (f.salaryFrom != null && f.salaryFrom !== "") p.set("salary_from", String(f.salaryFrom));
-        if (f.salaryTo != null && f.salaryTo !== "") p.set("salary_to", String(f.salaryTo));
-        if (f.salaryPeriod) p.set("salary_period", f.salaryPeriod);
-      }
-      if (f.employmentType) p.set("employment_type", f.employmentType);
-      p.set("image", "auto");
-      if (token) p.set("token", token);
+    .map((f) => {
+      const base = new URLSearchParams();
+      if (f.division) base.set("division", f.division);
+      if (f.consultant) base.set("consultant", f.consultant);
+      if (f.title) base.set("title", f.title);
+      if (f.location) base.set("location", f.location);
+      if (f.employmentType) base.set("employment_type", f.employmentType);
+      base.set("image", "auto");
+      if (token) base.set("token", token);
+
+      // Version A — the salary as Tracker holds it.
+      const withSalary = new URLSearchParams(base);
+      if (f.salaryFrom != null && f.salaryFrom !== "") withSalary.set("salary_from", String(f.salaryFrom));
+      if (f.salaryTo != null && f.salaryTo !== "") withSalary.set("salary_to", String(f.salaryTo));
+      if (f.salaryPeriod) withSalary.set("salary_period", f.salaryPeriod);
+
+      // Version B — "Competitive" in place of the figures, for jobs where the
+      // salary is being withheld. Tracker's API does not expose the hide-salary
+      // tickbox, so both are sent and a human picks.
+      const competitive = new URLSearchParams(base);
+      competitive.set("salary_text", COMPETITIVE_LABEL);
 
       return {
-        id: String(opp.opportunityId || ""),
+        id: f.id,
         title: f.title,
         consultant: f.consultant,
+        consultantSource: f.consultantSource,
         division: f.division,
         location: f.location,
+        client: f.client,
+        reference: f.reference,
         publishDate: f.publishDate,
-        status: f.statusDesc,
-        salaryShown: f.hideSalary ? "hidden" : "shown",
-        salaryReason: f.hideSalaryReason,
-        imageUrl: origin + "/api/og?" + p.toString(),
+        status: f.status,
+        imageUrl: origin + "/api/og?" + withSalary.toString(),
+        imageUrlCompetitive: origin + "/api/og?" + competitive.toString(),
       };
     });
 
