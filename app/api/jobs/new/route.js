@@ -3,60 +3,31 @@ import { mapOpportunity } from "../../../../lib/mapping";
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
-// --- Tracker REST API (UK / "global" region) ------------------------------
-// Confirmed format: POST /api/Auth/ExchangeToken with { "bearerToken": "..." }
 const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.com";
 const AUTH_PATH = "/api/Auth/ExchangeToken";
 const SEARCH_PATH = "/api/v1/Opportunity/Search";
 const MAX_JOBS = 25;
 
-// Tracker sends "Sheffield, South Yorkshire" — the ad only wants the town.
-// Takes everything before the first comma; single-word locations pass through
-// unchanged.
-function shortLocation(loc) {
-  return (loc || "").split(",")[0].trim();
-}
-
-// Titles occasionally carry a trailing space from Tracker, which pushes the
-// full stop away from the last letter on the ad.
-function cleanTitle(t) {
-  return (t || "").replace(/\s+/g, " ").trim();
-}
-
 function extractJwt(data) {
   if (!data) return null;
   if (typeof data === "string") return data.trim() || null;
   return (
-    data.token ||
-    data.jwt ||
-    data.accessToken ||
-    data.access_token ||
-    data.Token ||
-    data.JWT ||
-    (data.data && (data.data.token || data.data.jwt || data.data.accessToken)) ||
-    null
+    data.token || data.jwt || data.accessToken || data.access_token ||
+    data.Token || data.JWT ||
+    (data.data && (data.data.token || data.data.jwt || data.data.accessToken)) || null
   );
 }
 
 async function getJwt() {
   const bearer = (process.env.TRACKER_BEARER_TOKEN || "").trim();
   if (!bearer) throw new Error("TRACKER_BEARER_TOKEN env var is not set");
-
   const res = await fetch(TRACKER_BASE + AUTH_PATH, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ bearerToken: bearer }),
   });
-
   const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(
-      "Token exchange failed (" + res.status + "): " + text.slice(0, 400) +
-      " [token length seen: " + bearer.length + "]"
-    );
-  }
-
+  if (!res.ok) throw new Error("Token exchange failed (" + res.status + "): " + text.slice(0, 400));
   let data;
   try { data = JSON.parse(text); } catch { data = text; }
   const jwt = extractJwt(data);
@@ -71,9 +42,7 @@ async function searchOpportunities(jwt) {
     body: JSON.stringify({}),
   });
   const text = await res.text();
-  if (!res.ok) {
-    throw new Error("Opportunity search failed (" + res.status + "): " + text.slice(0, 500));
-  }
+  if (!res.ok) throw new Error("Opportunity search failed (" + res.status + "): " + text.slice(0, 500));
   let data;
   try { data = JSON.parse(text); } catch { data = null; }
   if (Array.isArray(data)) return data;
@@ -88,6 +57,8 @@ export async function GET(req) {
   }
 
   const wantDebug = url.searchParams.get("debug") === "1";
+  const wantFields = url.searchParams.get("fields") === "1";
+  const showAll = url.searchParams.get("all") === "1";
 
   let list;
   try {
@@ -99,43 +70,69 @@ export async function GET(req) {
     });
   }
 
-  // ?debug=1 shows the raw Tracker records so we can confirm the exact field
-  // names for salary-hide and full/part-time.
   if (wantDebug) {
     return new Response(JSON.stringify({ count: list.length, sample: list.slice(0, 2) }, null, 2), {
       headers: { "content-type": "application/json" },
     });
   }
 
+  // ?fields=1 — a compact table of every job's salary-related fields, for
+  // comparing against what the website actually prints. This is how we find
+  // out which field carries the "hide salary" decision.
+  if (wantFields) {
+    const rows = list.map((o) => ({
+      id: o.opportunityId,
+      ref: o.publishReference || "",
+      title: (o.publishTitle || o.opportunityName || "").trim(),
+      online: o.publishOnline,
+      status: o.opportunityStatusDesc,
+      salaryFrom: o.publishSalaryFrom,
+      salaryTo: o.publishSalaryTo,
+      salaryPer: o.publishSalaryPer,
+      rate: o.opportunityRate,
+      benefits: o.publishBenefits,
+      currency: o.currencyCode,
+    }));
+    return new Response(JSON.stringify({ count: rows.length, rows }, null, 2), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const origin = url.origin;
+
   const jobs = list
     .map((opp) => ({ opp, f: mapOpportunity(opp) }))
-    .filter((x) => x.f.advertised && x.f.title)
+    .filter((x) => showAll || (x.f.advertised && x.f.active && !x.f.dead && x.f.title))
+    .sort((a, b) => String(b.f.publishDate).localeCompare(String(a.f.publishDate)))
     .slice(0, MAX_JOBS)
     .map(({ opp, f }) => {
-      const title = cleanTitle(f.title);
-      const location = shortLocation(f.location);
-
       const p = new URLSearchParams();
       if (f.division) p.set("division", f.division);
       if (f.consultant) p.set("consultant", f.consultant);
-      if (title) p.set("title", title);
-      if (location) p.set("location", location);
-      if (f.salaryFrom != null && f.salaryFrom !== "") p.set("salary_from", String(f.salaryFrom));
-      if (f.salaryTo != null && f.salaryTo !== "") p.set("salary_to", String(f.salaryTo));
-      if (f.salaryPeriod) p.set("salary_period", f.salaryPeriod);
-      if (f.hideSalary) p.set("hide_salary", f.hideSalary);
+      if (f.title) p.set("title", f.title);
+      if (f.location) p.set("location", f.location);
+
+      if (!f.hideSalary) {
+        if (f.salaryFrom != null && f.salaryFrom !== "") p.set("salary_from", String(f.salaryFrom));
+        if (f.salaryTo != null && f.salaryTo !== "") p.set("salary_to", String(f.salaryTo));
+        if (f.salaryPeriod) p.set("salary_period", f.salaryPeriod);
+      }
+
       if (f.employmentType) p.set("employment_type", f.employmentType);
       if (f.workingPattern) p.set("working_pattern", f.workingPattern);
       p.set("image", "auto");
       if (token) p.set("token", token);
 
       return {
-        id: String(opp.advertId || opp.opportunityId || ""),
-        title,
+        id: String(opp.opportunityId || opp.advertId || ""),
+        title: f.title,
         consultant: f.consultant,
         division: f.division,
-        location,
+        location: f.location,
+        publishDate: f.publishDate,
+        status: f.statusDesc,
+        salaryShown: f.hideSalary ? "hidden" : "shown",
+        salaryReason: f.hideSalaryReason,
         imageUrl: origin + "/api/og?" + p.toString(),
       };
     });
