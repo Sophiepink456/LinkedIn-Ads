@@ -1,5 +1,5 @@
 import { mapOpportunity } from "../../../../lib/mapping";
-import { COMPETITIVE_LABEL, isExcludedDepartment, resolveDivision } from "../../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision } from "../../../../lib/config";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -9,25 +9,21 @@ const AUTH_PATH = "/api/Auth/ExchangeToken";
 const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 
 // ---------------------------------------------------------------------------
-// Tracker's PagedSearch honours publishOnline, state and updatedAfter, ignores
-// pageSize (always 10) and all sort parameters, and nests results under
-// "opportunities".
+// Tracker's PagedSearch honours state and updatedAfter, ignores pageSize
+// (always 10) and all sort parameters, and nests results under "opportunities".
 //
-// publishOnline is the "Publish On My Website?" toggle and it does track the
-// site — jobs set to "n", including internal test records, are not on it.
-// advertStatus reads "A" on almost everything (test jobs included) so it
-// cannot be used in its place.
+// publishOnline is deliberately NOT used. Despite its label it does not track
+// the website: jobs appear there with it set to false. advertStatus "A" is the
+// signal, with internal test records excluded by name and client instead.
 //
-// The publishOnline filter also keeps the result set small enough to page
-// through. Without it the query returns 456 records; the cap silently dropped
-// a third of them, which is what made a live job look like it had been
-// filtered out. truncated:true in the output now warns if that ever happens.
+// Without the publishOnline filter the query returns ~456 records, so the page
+// cap matters — truncated:true in the ?list=1 output warns if it is ever hit.
 // ---------------------------------------------------------------------------
 const UPDATED_WITHIN_DAYS = 14;
 const PUBLISHED_WITHIN_DAYS = 3;
-const MAX_PAGES = 40;
-const MAX_JOBS = 25;
-const MAX_DETAIL_FETCHES = 40;
+const MAX_PAGES = 60;
+const MAX_JOBS = 40;
+const MAX_DETAIL_FETCHES = 60;
 
 function daysAgoISO(days) {
   return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
@@ -92,8 +88,6 @@ async function fetchAllPages(jwt, baseBody) {
 
     if (!(r.data && r.data.hasNextPage) || list.length === 0) break;
     page += 1;
-
-    // Ran out of pages before Tracker ran out of records.
     if (page > MAX_PAGES) truncated = true;
   }
 
@@ -149,7 +143,6 @@ export async function GET(req) {
   }
 
   const query = {
-    publishOnline: true,
     state: "open",
     updatedAfter: daysAgoISO(days),
   };
@@ -189,6 +182,8 @@ export async function GET(req) {
     .map((opp) => mapOpportunity(opp))
     .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
     .filter((f) => !isExcludedDepartment(f.department))
+    // Internal test and training records — see config.js.
+    .filter((f) => !isTestRecord(f.title, f.client))
     .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
     .slice(0, MAX_JOBS)
     .map((f) => {
