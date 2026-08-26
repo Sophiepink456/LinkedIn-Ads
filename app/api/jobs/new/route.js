@@ -6,15 +6,27 @@ export const dynamic = "force-dynamic";
 
 const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.com";
 const AUTH_PATH = "/api/Auth/ExchangeToken";
-const SEARCH_PATH = "/api/v1/Opportunity/Search";
 const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 
+// ---------------------------------------------------------------------------
+// Confirmed behaviour of Tracker's PagedSearch, from probing:
+//   - honours publishOnline, state and updatedAfter
+//   - IGNORES pageSize (always 10) and any sort parameters
+//   - wraps results in "opportunities", with totalCount / hasNextPage alongside
+//
+// publishOnline:true alone returns 1,154 records (all history). Adding
+// state:"open" cuts that to ~160. Since we cannot sort, we also limit by date
+// so the set stays small enough to page through quickly.
+// ---------------------------------------------------------------------------
+const DAYS_BACK = 7;        // how far back to look; override with ?days=N
+const MAX_PAGES = 12;       // safety valve — 120 records
 const MAX_JOBS = 25;
 const MAX_DETAIL_FETCHES = 30;
 
-// Confirmed by probing: PagedSearch honours publishOnline and wraps its
-// results in an "opportunities" key, with paging metadata alongside.
-const LIVE_QUERY = { publishOnline: true, pageNumber: 1, pageSize: 100 };
+function daysAgoISO(days) {
+  const d = new Date(Date.now() - days * 86400000);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
 
 function extractJwt(data) {
   if (!data) return null;
@@ -55,11 +67,35 @@ async function postJson(jwt, path, body) {
   return { ok: res.ok, status: res.status, text, data };
 }
 
-// PagedSearch nests results under "opportunities". Plain Search returns a bare
-// array. Handle both.
 function asList(data) {
   if (Array.isArray(data)) return data;
-  return (data && (data.opportunities || data.data || data.results || data.items || data.records)) || [];
+  return (data && (data.opportunities || data.data || data.results || data.items)) || [];
+}
+
+// Walk the pages until Tracker says there are no more, or we hit the cap.
+async function fetchAllPages(jwt, baseBody) {
+  const all = [];
+  let page = 1;
+  let meta = {};
+
+  while (page <= MAX_PAGES) {
+    const r = await postJson(jwt, PAGED_SEARCH_PATH, { ...baseBody, pageNumber: page });
+    if (!r.ok) break;
+
+    const list = asList(r.data);
+    all.push(...list);
+    meta = {
+      totalCount: r.data && r.data.totalCount,
+      totalPages: r.data && r.data.totalPages,
+      pagesFetched: page,
+    };
+
+    const hasNext = r.data && r.data.hasNextPage;
+    if (!hasNext || list.length === 0) break;
+    page += 1;
+  }
+
+  return { list: all, meta };
 }
 
 async function getOpportunity(jwt, id) {
@@ -76,39 +112,6 @@ function shallowDate(o) {
   return String(o.publishDate || o.lastUpdatedDateTime || o.creationDate || "");
 }
 
-// Focused probe: now that PagedSearch is understood, work out how many live
-// jobs there are and whether sorting is honoured.
-const PROBE_BODIES = [
-  { label: "paged: publishOnline true", body: { publishOnline: true, pageNumber: 1, pageSize: 100 } },
-  { label: "paged: publishOnline + state open", body: { publishOnline: true, state: "open", pageNumber: 1, pageSize: 100 } },
-  { label: "paged: sort publishDate desc", body: { publishOnline: true, sortField: "publishDate", sortDir: "desc", pageNumber: 1, pageSize: 100 } },
-  { label: "paged: sort lastUpdated desc", body: { publishOnline: true, sortField: "lastUpdatedDateTime", sortDir: "desc", pageNumber: 1, pageSize: 100 } },
-  { label: "paged: updatedAfter 2026-08-01", body: { publishOnline: true, updatedAfter: "2026-08-01", pageNumber: 1, pageSize: 100 } },
-  { label: "paged: pageSize 5 (is it honoured?)", body: { publishOnline: true, pageNumber: 1, pageSize: 5 } },
-];
-
-async function runProbe(jwt) {
-  const results = [];
-  for (const p of PROBE_BODIES) {
-    const r = await postJson(jwt, PAGED_SEARCH_PATH, p.body);
-    if (!r.ok) {
-      results.push({ tried: p.label, status: r.status, error: r.text.slice(0, 200) });
-      continue;
-    }
-    const list = asList(r.data);
-    results.push({
-      tried: p.label,
-      returned: list.length,
-      totalCount: r.data && r.data.totalCount,
-      totalPages: r.data && r.data.totalPages,
-      pageSizeEcho: r.data && r.data.pageSize,
-      first: list[0] ? { title: list[0].publishTitle || list[0].opportunityName || list[0].name, date: shallowDate(list[0]), online: list[0].publishOnline } : null,
-      last: list.length > 1 ? { title: list[list.length - 1].publishTitle || list[list.length - 1].opportunityName || list[list.length - 1].name, date: shallowDate(list[list.length - 1]) } : null,
-    });
-  }
-  return results;
-}
-
 export async function GET(req) {
   const url = new URL(req.url);
   const token = process.env.SHARE_TOKEN;
@@ -117,8 +120,8 @@ export async function GET(req) {
   }
 
   const jobId = url.searchParams.get("job");
-  const wantProbe = url.searchParams.get("probe") === "1";
   const wantList = url.searchParams.get("list") === "1";
+  const days = parseInt(url.searchParams.get("days") || "", 10) || DAYS_BACK;
 
   let jwt;
   try {
@@ -146,50 +149,30 @@ export async function GET(req) {
     });
   }
 
-  if (wantProbe) {
-    const results = await runProbe(jwt);
-    return new Response(JSON.stringify({ results }, null, 2), {
-      headers: { "content-type": "application/json" },
-    });
-  }
+  const query = {
+    publishOnline: true,
+    state: "open",
+    updatedAfter: daysAgoISO(days),
+  };
 
-  // --- Fetch the live jobs -------------------------------------------------
-  let search = await postJson(jwt, PAGED_SEARCH_PATH, LIVE_QUERY);
-  let usedEndpoint = "PagedSearch";
+  const { list: shallow, meta } = await fetchAllPages(jwt, query);
 
-  // Fall back to plain Search if PagedSearch ever misbehaves.
-  if (!search.ok || asList(search.data).length === 0) {
-    search = await postJson(jwt, SEARCH_PATH, { publishOnline: true });
-    usedEndpoint = "Search (fallback)";
-  }
-
-  if (!search.ok) {
-    return new Response(JSON.stringify({ error: "Search failed (" + search.status + "): " + search.text.slice(0, 300) }, null, 2), {
-      status: 502, headers: { "content-type": "application/json" },
-    });
-  }
-
-  const shallow = asList(search.data);
-
-  // ?list=1 — the shallow list before any detail fetching, for checking what
-  // the search actually returned.
   if (wantList) {
     return new Response(JSON.stringify({
-      endpoint: usedEndpoint,
+      query,
+      ...meta,
       returned: shallow.length,
-      totalCount: search.data && search.data.totalCount,
       rows: shallow.map((o) => ({
         id: o.opportunityId || o.id,
         title: o.publishTitle || o.opportunityName || o.name,
         online: o.publishOnline,
         status: o.opportunityStatusDesc,
         publishDate: o.publishDate,
+        updated: o.lastUpdatedDateTime,
       })),
     }, null, 2), { headers: { "content-type": "application/json" } });
   }
 
-  // Newest first, then fetch the full record for each — the search results are
-  // too thin to build an ad from.
   const ids = shallow
     .slice()
     .sort((a, b) => shallowDate(b).localeCompare(shallowDate(a)))
