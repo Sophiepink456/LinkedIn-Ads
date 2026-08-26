@@ -9,17 +9,23 @@ const AUTH_PATH = "/api/Auth/ExchangeToken";
 const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 
 // ---------------------------------------------------------------------------
-// Tracker's PagedSearch honours state and updatedAfter, ignores pageSize
-// (always 10) and all sort parameters, and nests results under "opportunities".
+// Tracker's PagedSearch honours publishOnline, state and updatedAfter, ignores
+// pageSize (always 10) and all sort parameters, and nests results under
+// "opportunities".
 //
-// NOTE: publishOnline is deliberately NOT used to filter. Jobs appear on the
-// Elevation website with publishOnline set to false — confirmed on several
-// records — so filtering on it dropped live vacancies. Each job's advertStatus
-// is checked instead, after the full record is fetched.
+// publishOnline is the "Publish On My Website?" toggle and it does track the
+// site — jobs set to "n", including internal test records, are not on it.
+// advertStatus reads "A" on almost everything (test jobs included) so it
+// cannot be used in its place.
+//
+// The publishOnline filter also keeps the result set small enough to page
+// through. Without it the query returns 456 records; the cap silently dropped
+// a third of them, which is what made a live job look like it had been
+// filtered out. truncated:true in the output now warns if that ever happens.
 // ---------------------------------------------------------------------------
 const UPDATED_WITHIN_DAYS = 14;
 const PUBLISHED_WITHIN_DAYS = 3;
-const MAX_PAGES = 30;
+const MAX_PAGES = 40;
 const MAX_JOBS = 25;
 const MAX_DETAIL_FETCHES = 40;
 
@@ -75,16 +81,23 @@ async function fetchAllPages(jwt, baseBody) {
   const all = [];
   let page = 1;
   let meta = {};
+  let truncated = false;
+
   while (page <= MAX_PAGES) {
     const r = await postJson(jwt, PAGED_SEARCH_PATH, { ...baseBody, pageNumber: page });
     if (!r.ok) break;
     const list = asList(r.data);
     all.push(...list);
     meta = { totalCount: r.data && r.data.totalCount, pagesFetched: page };
+
     if (!(r.data && r.data.hasNextPage) || list.length === 0) break;
     page += 1;
+
+    // Ran out of pages before Tracker ran out of records.
+    if (page > MAX_PAGES) truncated = true;
   }
-  return { list: all, meta };
+
+  return { list: all, meta: { ...meta, truncated } };
 }
 
 async function getOpportunity(jwt, id) {
@@ -135,8 +148,8 @@ export async function GET(req) {
     });
   }
 
-  // No publishOnline filter — see the note at the top of this file.
   const query = {
+    publishOnline: true,
     state: "open",
     updatedAfter: daysAgoISO(days),
   };
@@ -174,8 +187,6 @@ export async function GET(req) {
   const jobs = details
     .filter(Boolean)
     .map((opp) => mapOpportunity(opp))
-    // advertStatus "A" means the advert is live. Filled or closed jobs are out
-    // regardless.
     .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
     .filter((f) => !isExcludedDepartment(f.department))
     .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
@@ -215,7 +226,6 @@ export async function GET(req) {
         reference: f.reference,
         publishDate: f.publishDate,
         status: f.status,
-        advertStatus: f.advertStatus,
         imageUrl: origin + "/api/og?" + withSalary.toString(),
         imageUrlCompetitive: origin + "/api/og?" + competitive.toString(),
       };
