@@ -10,6 +10,19 @@ const AUTH_PATH = "/api/Auth/ExchangeToken";
 const SEARCH_PATH = "/api/v1/Opportunity/Search";
 const MAX_JOBS = 25;
 
+// Tracker sends "Sheffield, South Yorkshire" — the ad only wants the town.
+// Takes everything before the first comma; single-word locations pass through
+// unchanged.
+function shortLocation(loc) {
+  return (loc || "").split(",")[0].trim();
+}
+
+// Titles occasionally carry a trailing space from Tracker, which pushes the
+// full stop away from the last letter on the ad.
+function cleanTitle(t) {
+  return (t || "").replace(/\s+/g, " ").trim();
+}
+
 function extractJwt(data) {
   if (!data) return null;
   if (typeof data === "string") return data.trim() || null;
@@ -26,8 +39,6 @@ function extractJwt(data) {
 }
 
 async function getJwt() {
-  // .trim() guards against a stray space or line break picked up when pasting
-  // the token into Vercel — a very common cause of "Invalid external token".
   const bearer = (process.env.TRACKER_BEARER_TOKEN || "").trim();
   if (!bearer) throw new Error("TRACKER_BEARER_TOKEN env var is not set");
 
@@ -102,11 +113,14 @@ export async function GET(req) {
     .filter((x) => x.f.advertised && x.f.title)
     .slice(0, MAX_JOBS)
     .map(({ opp, f }) => {
+      const title = cleanTitle(f.title);
+      const location = shortLocation(f.location);
+
       const p = new URLSearchParams();
       if (f.division) p.set("division", f.division);
       if (f.consultant) p.set("consultant", f.consultant);
-      if (f.title) p.set("title", f.title);
-      if (f.location) p.set("location", f.location);
+      if (title) p.set("title", title);
+      if (location) p.set("location", location);
       if (f.salaryFrom != null && f.salaryFrom !== "") p.set("salary_from", String(f.salaryFrom));
       if (f.salaryTo != null && f.salaryTo !== "") p.set("salary_to", String(f.salaryTo));
       if (f.salaryPeriod) p.set("salary_period", f.salaryPeriod);
@@ -115,12 +129,13 @@ export async function GET(req) {
       if (f.workingPattern) p.set("working_pattern", f.workingPattern);
       p.set("image", "auto");
       if (token) p.set("token", token);
+
       return {
         id: String(opp.advertId || opp.opportunityId || ""),
-        title: f.title,
+        title,
         consultant: f.consultant,
         division: f.division,
-        location: f.location,
+        location,
         imageUrl: origin + "/api/og?" + p.toString(),
       };
     });
