@@ -1,5 +1,5 @@
 import { mapOpportunity } from "../../../../lib/mapping";
-import { COMPETITIVE_LABEL } from "../../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, resolveDivision } from "../../../../lib/config";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -8,18 +8,10 @@ const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.c
 const AUTH_PATH = "/api/Auth/ExchangeToken";
 const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 
-// ---------------------------------------------------------------------------
-// Tracker's PagedSearch, as established by probing:
-//   - honours publishOnline, state and updatedAfter
-//   - IGNORES pageSize (always 10) and any sort parameters
-//   - wraps results in "opportunities" with totalCount / hasNextPage alongside
-//
-// We ask for open, published jobs touched recently, then narrow to the ones
-// actually PUBLISHED recently. Those are two different things: a job published
-// in July can be updated today, and that is not a new advert.
-// ---------------------------------------------------------------------------
-const UPDATED_WITHIN_DAYS = 14;   // how far back to trawl; ?days=N
-const PUBLISHED_WITHIN_DAYS = 3;  // what counts as a new advert; ?pubdays=N
+// Tracker's PagedSearch honours publishOnline, state and updatedAfter, ignores
+// pageSize and sorting, and wraps results in "opportunities".
+const UPDATED_WITHIN_DAYS = 14;
+const PUBLISHED_WITHIN_DAYS = 3;
 const MAX_PAGES = 15;
 const MAX_JOBS = 25;
 const MAX_DETAIL_FETCHES = 30;
@@ -144,8 +136,6 @@ export async function GET(req) {
 
   const { list: shallow, meta } = await fetchAllPages(jwt, query);
 
-  // Narrow to jobs actually published recently. A job updated today but
-  // published in July is not a new advert.
   const publishedCutoff = daysAgoISO(pubDays);
   const recent = shallow
     .filter((o) => String(o.publishDate || "") >= publishedCutoff)
@@ -163,7 +153,6 @@ export async function GET(req) {
         title: o.publishTitle || o.opportunityName || o.name,
         status: o.opportunityStatusDesc,
         publishDate: o.publishDate,
-        updated: o.lastUpdatedDateTime,
       })),
     }, null, 2), { headers: { "content-type": "application/json" } });
   }
@@ -177,11 +166,18 @@ export async function GET(req) {
     .filter(Boolean)
     .map((opp) => mapOpportunity(opp))
     .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
+    // Parkinson Lee is a separate company — no ads for its roles.
+    .filter((f) => !isExcludedDepartment(f.department))
     .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
     .slice(0, MAX_JOBS)
     .map((f) => {
+      // Resolved here as well as in the renderer, so the feed can flag any job
+      // whose division could not be worked out.
+      const division = resolveDivision(f.department, f.consultant);
+
       const base = new URLSearchParams();
-      if (f.division) base.set("division", f.division);
+      // Send the department; the renderer resolves it the same way.
+      if (f.department) base.set("division", f.department);
       if (f.consultant) base.set("consultant", f.consultant);
       if (f.title) base.set("title", f.title);
       if (f.location) base.set("location", f.location);
@@ -189,13 +185,11 @@ export async function GET(req) {
       base.set("image", "auto");
       if (token) base.set("token", token);
 
-      // Version A: the salary as Tracker holds it.
       const withSalary = new URLSearchParams(base);
       if (f.salaryFrom != null && f.salaryFrom !== "") withSalary.set("salary_from", String(f.salaryFrom));
       if (f.salaryTo != null && f.salaryTo !== "") withSalary.set("salary_to", String(f.salaryTo));
       if (f.salaryPeriod) withSalary.set("salary_period", f.salaryPeriod);
 
-      // Version B: "Competitive" instead, for jobs where the salary is withheld.
       const competitive = new URLSearchParams(base);
       competitive.set("salary_text", COMPETITIVE_LABEL);
 
@@ -204,7 +198,11 @@ export async function GET(req) {
         title: f.title,
         consultant: f.consultant,
         consultantSource: f.consultantSource,
-        division: f.division,
+        department: f.department,
+        division,
+        // Flags a job whose consultant is not on the division list, so the ad
+        // would go out with no division line.
+        needsReview: !division && String(f.department || "").toUpperCase() !== "INTERNAL OFFICE",
         location: f.location,
         client: f.client,
         reference: f.reference,
