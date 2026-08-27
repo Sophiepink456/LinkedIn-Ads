@@ -1,133 +1,232 @@
-import { ImageResponse } from "next/og";
-import { GREEN, PHOTO_BASE_URL, BACKGROUNDS, resolveDivision, resolveType } from "../../../lib/config";
-import { formatSalary, parseRange } from "../../../lib/salary";
+import { mapOpportunity } from "../../../../lib/mapping";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision } from "../../../../lib/config";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
-// ---- Layout ---------------------------------------------------------------
-const TEXT_LEFT = 100;
-const TITLE_SIZE = 92;
-const TITLE_BLOCK_BOTTOM = 396;
-const SECTOR_SIZE = 34;
-const SECTOR_GAP = 23;
-const RIGHT_MARGIN = 90;
-const LOCATION_LEFT = 164;
-const LOCATION_CENTER_Y = 1026;
-const LOCATION_BOX_H = 60;
-const LOCATION_SIZE = 38;
+const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.com";
+const AUTH_PATH = "/api/Auth/ExchangeToken";
+const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
+
 // ---------------------------------------------------------------------------
+// Tracker's PagedSearch honours state and updatedAfter, ignores pageSize
+// (always 10) and all sort parameters, and nests results under "opportunities".
+//
+// publishOnline is deliberately NOT used. Despite its label it does not track
+// the website: jobs appear there with it set to false. advertStatus "A" is the
+// signal, with internal test records excluded by name and client instead.
+//
+// Without the publishOnline filter the query returns ~456 records, so the page
+// cap matters — truncated:true in the ?list=1 output warns if it is ever hit.
+// ---------------------------------------------------------------------------
+const UPDATED_WITHIN_DAYS = 14;
+const PUBLISHED_WITHIN_DAYS = 3;
+const MAX_PAGES = 60;
+const MAX_JOBS = 80;
+const MAX_DETAIL_FETCHES = 80;
 
-function resolveImage(origin, file) {
-  if (file.startsWith("http")) return file;
-  const base = PHOTO_BASE_URL.startsWith("http") ? PHOTO_BASE_URL : origin + PHOTO_BASE_URL;
-  return base + file;
+function daysAgoISO(days) {
+  return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
 }
 
-function pickBackground(origin, param) {
-  if (param && param !== "auto") return resolveImage(origin, param);
-  const f = BACKGROUNDS[Math.floor(Math.random() * BACKGROUNDS.length)];
-  return resolveImage(origin, f);
+function extractJwt(data) {
+  if (!data) return null;
+  if (typeof data === "string") return data.trim() || null;
+  return (
+    data.token || data.jwt || data.accessToken || data.access_token ||
+    data.Token || data.JWT ||
+    (data.data && (data.data.token || data.data.jwt || data.data.accessToken)) || null
+  );
 }
 
-// The URL ends "/api/og?..." with no extension, so anything downloading it has
-// nothing to go on and labels the result a generic file. This builds a proper
-// name from the job title, e.g. "senior-design-engineer-competitive.png".
-function buildFilename(title, isCompetitive) {
-  const base = String(title || "vacancy")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60) || "vacancy";
-  return base + (isCompetitive ? "-competitive" : "") + ".png";
+async function getJwt() {
+  const bearer = (process.env.TRACKER_BEARER_TOKEN || "").trim();
+  if (!bearer) throw new Error("TRACKER_BEARER_TOKEN env var is not set");
+  const res = await fetch(TRACKER_BASE + AUTH_PATH, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bearerToken: bearer }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error("Token exchange failed (" + res.status + "): " + text.slice(0, 400));
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  const jwt = extractJwt(data);
+  if (!jwt) throw new Error("Exchange succeeded but no JWT found in: " + text.slice(0, 400));
+  return jwt;
+}
+
+async function postJson(jwt, path, body) {
+  const res = await fetch(TRACKER_BASE + path, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* leave null */ }
+  return { ok: res.ok, status: res.status, text, data };
+}
+
+function asList(data) {
+  if (Array.isArray(data)) return data;
+  return (data && (data.opportunities || data.data || data.results || data.items)) || [];
+}
+
+async function fetchAllPages(jwt, baseBody) {
+  const all = [];
+  let page = 1;
+  let meta = {};
+  let truncated = false;
+
+  while (page <= MAX_PAGES) {
+    const r = await postJson(jwt, PAGED_SEARCH_PATH, { ...baseBody, pageNumber: page });
+    if (!r.ok) break;
+    const list = asList(r.data);
+    all.push(...list);
+    meta = { totalCount: r.data && r.data.totalCount, pagesFetched: page };
+
+    if (!(r.data && r.data.hasNextPage) || list.length === 0) break;
+    page += 1;
+    if (page > MAX_PAGES) truncated = true;
+  }
+
+  return { list: all, meta: { ...meta, truncated } };
+}
+
+async function getOpportunity(jwt, id) {
+  const res = await fetch(TRACKER_BASE + "/api/v1/Opportunity/" + encodeURIComponent(id), {
+    method: "GET",
+    headers: { Authorization: "Bearer " + jwt },
+  });
+  if (!res.ok) return null;
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return null; }
 }
 
 export async function GET(req) {
-  const { searchParams, origin } = new URL(req.url);
-
-  const required = process.env.SHARE_TOKEN;
-  if (required && searchParams.get("token") !== required) {
+  const url = new URL(req.url);
+  const token = process.env.SHARE_TOKEN;
+  if (token && url.searchParams.get("token") !== token) {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  const rawDivision = searchParams.get("division") || searchParams.get("sector") || "";
-  const consultant = searchParams.get("consultant") || "";
-  const sector = resolveDivision(rawDivision, consultant).toUpperCase();
-  const title = (searchParams.get("title") || "Job Title").trim();
-  const location = (searchParams.get("location") || "").trim();
+  const jobId = url.searchParams.get("job");
+  const wantList = url.searchParams.get("list") === "1";
+  const days = parseInt(url.searchParams.get("days") || "", 10) || UPDATED_WITHIN_DAYS;
+  const pubDays = parseInt(url.searchParams.get("pubdays") || "", 10) || PUBLISHED_WITHIN_DAYS;
 
-  let sFrom = searchParams.get("salary_from");
-  let sTo = searchParams.get("salary_to");
-  const salaryRaw = searchParams.get("salary");
-  if (!sFrom && !sTo && salaryRaw) {
-    const r = parseRange(salaryRaw);
-    sFrom = r.from; sTo = r.to;
+  let jwt;
+  try {
+    jwt = await getJwt();
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
   }
 
-  // salary_text overrides everything — used for the "Competitive" version.
-  const salaryText = (searchParams.get("salary_text") || "").trim();
-  const salary = salaryText || formatSalary({
-    from: sFrom,
-    to: sTo,
-    period: searchParams.get("salary_period") || salaryRaw,
-    hide: searchParams.get("hide_salary"),
-  });
-
-  const typeLabel = resolveType(
-    searchParams.get("employment_type"),
-    searchParams.get("working_pattern")
-  );
-  const bg = pickBackground(origin, searchParams.get("image"));
-  const locSalary = [location, salary, typeLabel].filter(Boolean).join(" | ");
-
-  const [bold, semiBold] = await Promise.all([
-    fetch(new URL("../../fonts/Area-Bold.otf", import.meta.url)).then((r) => r.arrayBuffer()),
-    fetch(new URL("../../fonts/Area-SemiBold.otf", import.meta.url)).then((r) => r.arrayBuffer()),
-  ]);
-
-  const words = title.split(" ");
-  const lastWord = words.pop();
-
-  const filename = buildFilename(title, !!salaryText);
-
-  return new ImageResponse(
-    (
-      <div style={{ position: "relative", width: "1080px", height: "1350px", display: "flex", fontFamily: "Area" }}>
-        <img src={bg} width={1080} height={1350}
-          style={{ position: "absolute", top: 0, left: 0, width: "1080px", height: "1350px", objectFit: "cover" }} />
-
-        <div style={{ position: "absolute", left: TEXT_LEFT, bottom: TITLE_BLOCK_BOTTOM,
-          width: 1080 - TEXT_LEFT - RIGHT_MARGIN, display: "flex", flexDirection: "column" }}>
-          {sector ? (
-            <div style={{ display: "flex", color: GREEN, fontSize: SECTOR_SIZE, fontWeight: 600,
-              letterSpacing: "2px", marginBottom: SECTOR_GAP }}>{sector}</div>
-          ) : null}
-          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", color: "#ffffff",
-            fontSize: TITLE_SIZE, fontWeight: 700, lineHeight: 1.2, letterSpacing: "-1px" }}>
-            {words.map((w, i) => (<span key={i} style={{ marginRight: "0.28em" }}>{w}</span>))}
-            <span style={{ display: "flex" }}>{lastWord}<span style={{ color: GREEN }}>.</span></span>
-          </div>
-        </div>
-
-        <div style={{ position: "absolute", left: LOCATION_LEFT, top: LOCATION_CENTER_Y - LOCATION_BOX_H / 2,
-          height: LOCATION_BOX_H, display: "flex", alignItems: "center" }}>
-          <div style={{ display: "flex", color: "#ffffff", fontSize: LOCATION_SIZE, fontWeight: 600 }}>{locSalary}</div>
-        </div>
-      </div>
-    ),
-    {
-      width: 1080,
-      height: 1350,
-      fonts: [
-        { name: "Area", data: bold, weight: 700, style: "normal" },
-        { name: "Area", data: semiBold, weight: 600, style: "normal" },
-      ],
-      headers: {
-        "Content-Type": "image/png",
-        // "inline" keeps it viewable in a browser tab while still supplying the
-        // name that download tools and Zapier use for the attachment.
-        "Content-Disposition": 'inline; filename="' + filename + '"',
-      },
+  if (jobId) {
+    const opp = await getOpportunity(jwt, jobId);
+    if (!opp) {
+      return new Response(JSON.stringify({ error: "No record found for id " + jobId }, null, 2), {
+        status: 404, headers: { "content-type": "application/json" },
+      });
     }
-  );
+    if (url.searchParams.get("mapped") === "1") {
+      return new Response(JSON.stringify(mapOpportunity(opp), null, 2), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify(opp, null, 2), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const query = {
+    state: "open",
+    updatedAfter: daysAgoISO(days),
+  };
+
+  const { list: shallow, meta } = await fetchAllPages(jwt, query);
+
+  const publishedCutoff = daysAgoISO(pubDays);
+  const recent = shallow
+    .filter((o) => String(o.publishDate || "") >= publishedCutoff)
+    .sort((a, b) => String(b.publishDate || "").localeCompare(String(a.publishDate || "")));
+
+  if (wantList) {
+    return new Response(JSON.stringify({
+      query,
+      publishedOnOrAfter: publishedCutoff,
+      ...meta,
+      matchedUpdateWindow: shallow.length,
+      matchedPublishWindow: recent.length,
+      rows: recent.map((o) => ({
+        id: o.opportunityId || o.id,
+        title: o.publishTitle || o.opportunityName || o.name,
+        status: o.opportunityStatusDesc,
+        advertStatus: o.advertStatus,
+        publishOnline: o.publishOnline,
+        publishDate: o.publishDate,
+      })),
+    }, null, 2), { headers: { "content-type": "application/json" } });
+  }
+
+  const ids = recent.map((o) => o.opportunityId || o.id).filter(Boolean).slice(0, MAX_DETAIL_FETCHES);
+  const details = await Promise.all(ids.map((id) => getOpportunity(jwt, id)));
+
+  const origin = url.origin;
+
+  const jobs = details
+    .filter(Boolean)
+    .map((opp) => mapOpportunity(opp))
+    .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
+    .filter((f) => !isExcludedDepartment(f.department))
+    // Internal test and training records — see config.js.
+    .filter((f) => !isTestRecord(f.title, f.client))
+    .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
+    .slice(0, MAX_JOBS)
+    .map((f) => {
+      const division = resolveDivision(f.department, f.consultant);
+
+      const base = new URLSearchParams();
+      if (f.department) base.set("division", f.department);
+      if (f.consultant) base.set("consultant", f.consultant);
+      if (f.title) base.set("title", f.title);
+      if (f.location) base.set("location", f.location);
+      if (f.employmentType) base.set("employment_type", f.employmentType);
+      base.set("image", "auto");
+      if (token) base.set("token", token);
+
+      const withSalary = new URLSearchParams(base);
+      if (f.salaryFrom != null && f.salaryFrom !== "") withSalary.set("salary_from", String(f.salaryFrom));
+      if (f.salaryTo != null && f.salaryTo !== "") withSalary.set("salary_to", String(f.salaryTo));
+      if (f.salaryPeriod) withSalary.set("salary_period", f.salaryPeriod);
+
+      const competitive = new URLSearchParams(base);
+      competitive.set("salary_text", COMPETITIVE_LABEL);
+
+      return {
+        id: f.id,
+        title: f.title,
+        consultant: f.consultant,
+        // Ready for when the emails go to consultants rather than to you.
+        consultantEmail: f.consultantEmail,
+        consultantSource: f.consultantSource,
+        department: f.department,
+        division,
+        needsReview: !division && String(f.department || "").toUpperCase() !== "INTERNAL OFFICE",
+        location: f.location,
+        client: f.client,
+        reference: f.reference,
+        publishDate: f.publishDate,
+        status: f.status,
+        imageUrl: origin + "/api/og?" + withSalary.toString(),
+        imageUrlCompetitive: origin + "/api/og?" + competitive.toString(),
+      };
+    });
+
+  return new Response(JSON.stringify(jobs), {
+    headers: { "content-type": "application/json" },
+  });
 }
