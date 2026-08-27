@@ -30,6 +30,18 @@ function pickBackground(origin, param) {
   return resolveImage(origin, f);
 }
 
+// The URL ends "/api/og?..." with no extension, so anything downloading it has
+// nothing to go on and labels the result a generic file. This builds a proper
+// name from the job title, e.g. "senior-design-engineer-competitive.png".
+function buildFilename(title, isCompetitive) {
+  const base = String(title || "vacancy")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "vacancy";
+  return base + (isCompetitive ? "-competitive" : "") + ".png";
+}
+
 export async function GET(req) {
   const { searchParams, origin } = new URL(req.url);
 
@@ -52,9 +64,7 @@ export async function GET(req) {
     sFrom = r.from; sTo = r.to;
   }
 
-  // salary_text overrides everything — used for the "Competitive" version of
-  // an ad, so the same job can be rendered both ways without touching the
-  // salary figures.
+  // salary_text overrides everything — used for the "Competitive" version.
   const salaryText = (searchParams.get("salary_text") || "").trim();
   const salary = salaryText || formatSalary({
     from: sFrom,
@@ -77,6 +87,8 @@ export async function GET(req) {
 
   const words = title.split(" ");
   const lastWord = words.pop();
+
+  const filename = buildFilename(title, !!salaryText);
 
   return new ImageResponse(
     (
@@ -110,6 +122,12 @@ export async function GET(req) {
         { name: "Area", data: bold, weight: 700, style: "normal" },
         { name: "Area", data: semiBold, weight: 600, style: "normal" },
       ],
+      headers: {
+        "Content-Type": "image/png",
+        // "inline" keeps it viewable in a browser tab while still supplying the
+        // name that download tools and Zapier use for the attachment.
+        "Content-Disposition": 'inline; filename="' + filename + '"',
+      },
     }
   );
 }
