@@ -22,8 +22,8 @@ const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 const UPDATED_WITHIN_DAYS = 14;
 const PUBLISHED_WITHIN_DAYS = 3;
 const MAX_PAGES = 60;
-const MAX_JOBS = 40;
-const MAX_DETAIL_FETCHES = 60;
+const MAX_JOBS = 80;
+const MAX_DETAIL_FETCHES = 80;
 
 function daysAgoISO(days) {
   return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
