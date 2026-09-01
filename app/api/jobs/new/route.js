@@ -148,6 +148,28 @@ export async function GET(req) {
     });
   }
 
+  // ?register=1 — creates the Tracker webhooks that point at /api/tracker-hook.
+  // Registers Opportunity + Created and Opportunity + Updated. Add &undo=1 to
+  // delete them again.
+  if (url.searchParams.get("register") === "1") {
+    const hookUrl = url.origin + "/api/tracker-hook?token=" + encodeURIComponent(token || "");
+    const results = [];
+    for (const action of ["Created", "Updated"]) {
+      const r = await fetch(TRACKER_BASE + "/api/v1/Webhook", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
+        body: JSON.stringify({ url: hookUrl, action, recordType: "Opportunity" }),
+      });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = text.slice(0, 300); }
+      results.push({ action, status: r.status, ok: r.ok, body });
+    }
+    return new Response(JSON.stringify({ hookUrl, results }, null, 2), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   if (jobId) {
     const opp = await getOpportunity(jwt, jobId);
     if (!opp) {
