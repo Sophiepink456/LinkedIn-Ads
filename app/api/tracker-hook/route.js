@@ -26,9 +26,19 @@ const AUTH_PATH = "/api/Auth/ExchangeToken";
 const ZAPIER_HOOK =
   process.env.ZAPIER_HOOK_URL || "https://hooks.zapier.com/hooks/catch/20911531/4hr9bki/";
 
-// Ignore adverts published longer ago than this. Stops an edit to an old job
-// from generating a fresh ad months later.
-const MAX_ADVERT_AGE_DAYS = 14;
+// Only advertise jobs whose ADVERT is new.
+//
+// This is the crux of the whole thing. Tracker has no "advertised" event — we
+// trigger on Updated, which fires whenever anyone touches a record. Without a
+// tight age limit, editing a job advertised weeks ago produces a fresh ad,
+// because the system has never seen that job before.
+//
+// 1 day means: advertised today, so genuinely new. A consultant advertising a
+// job and then editing it still gets exactly one ad, because Zapier's Storage
+// step de-duplicates on the job id.
+//
+// Override per-request with ?maxage=N for testing.
+const MAX_ADVERT_AGE_DAYS = 1;
 
 function extractJwt(data) {
   if (!data) return null;
@@ -153,6 +163,7 @@ async function handle(req, body) {
   }
 
   const dryRun = url.searchParams.get("dry") === "1";
+  const maxAge = parseInt(url.searchParams.get("maxage") || "", 10) || MAX_ADVERT_AGE_DAYS;
   const recordId = findRecordId(body, url);
 
   if (!recordId) {
@@ -191,8 +202,12 @@ async function handle(req, body) {
   if (!f.title) reasons.push("no advert title");
   if (isExcludedDepartment(f.department)) reasons.push("excluded department");
   if (isTestRecord(f.title, f.client)) reasons.push("test or training record");
-  if (daysBetween(f.publishDate) > MAX_ADVERT_AGE_DAYS) {
-    reasons.push("advert published more than " + MAX_ADVERT_AGE_DAYS + " days ago");
+  const advertAge = daysBetween(f.publishDate);
+  if (advertAge > maxAge) {
+    reasons.push(
+      "advert published " + Math.round(advertAge) + " days ago (limit " + maxAge +
+      ") — this is an edit to an existing advert, not a new one"
+    );
   }
 
   if (reasons.length) {
