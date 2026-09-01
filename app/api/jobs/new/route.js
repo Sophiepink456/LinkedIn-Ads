@@ -125,6 +125,29 @@ export async function GET(req) {
     });
   }
 
+  // ?meta=1 — asks Tracker which webhook actions and record types exist, so we
+  // know the valid values for creating one. Tracker documents these fields as
+  // free-text strings, so this endpoint is the only way to find out.
+  if (url.searchParams.get("meta") === "1") {
+    const out = {};
+    for (const path of [
+      "/api/v1/Webhook/Meta/Actions",
+      "/api/v1/Webhook/Meta/RecordTypes",
+      "/api/v1/Webhook/List",
+    ]) {
+      const r = await fetch(TRACKER_BASE + path, {
+        method: "GET",
+        headers: { Authorization: "Bearer " + jwt },
+      });
+      const text = await r.text();
+      try { out[path] = { status: r.status, body: JSON.parse(text) }; }
+      catch { out[path] = { status: r.status, body: text.slice(0, 500) }; }
+    }
+    return new Response(JSON.stringify(out, null, 2), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   if (jobId) {
     const opp = await getOpportunity(jwt, jobId);
     if (!opp) {
@@ -142,10 +165,13 @@ export async function GET(req) {
     });
   }
 
-  const query = {
-    state: "open",
-    updatedAfter: daysAgoISO(days),
-  };
+  // ?nostate=1 drops the state filter. Tracker's search index appears to lag
+  // behind newly created records, and the state filter may make that worse —
+  // this lets us compare what each query actually returns.
+  const noState = url.searchParams.get("nostate") === "1";
+  const query = noState
+    ? { updatedAfter: daysAgoISO(days) }
+    : { state: "open", updatedAfter: daysAgoISO(days) };
 
   const { list: shallow, meta } = await fetchAllPages(jwt, query);
 
@@ -161,6 +187,12 @@ export async function GET(req) {
       ...meta,
       matchedUpdateWindow: shallow.length,
       matchedPublishWindow: recent.length,
+      // ?find=44770 reports whether a specific job came back from the search.
+      find: url.searchParams.get("find") ? {
+        id: url.searchParams.get("find"),
+        inSearchResults: shallow.some((o) => String(o.opportunityId || o.id) === url.searchParams.get("find")),
+        inPublishWindow: recent.some((o) => String(o.opportunityId || o.id) === url.searchParams.get("find")),
+      } : undefined,
       rows: recent.map((o) => ({
         id: o.opportunityId || o.id,
         title: o.publishTitle || o.opportunityName || o.name,
