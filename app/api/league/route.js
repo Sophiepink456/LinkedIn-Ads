@@ -153,8 +153,17 @@ export async function GET(req) {
   const wantMonth = monthKey(periodStart);
 
   let jwt;
+  let jwtInfo = null;
   try {
     jwt = await getJwt();
+    // A real JWT is three dot-separated segments. If this is short, or has no
+    // dots, the exchange returned something else and we accepted it.
+    jwtInfo = {
+      length: String(jwt).length,
+      segments: String(jwt).split(".").length,
+      startsWith: String(jwt).slice(0, 12),
+      looksLikeJwt: String(jwt).split(".").length === 3,
+    };
   } catch (e) {
     return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
       status: 502, headers: { "content-type": "application/json" },
@@ -176,9 +185,21 @@ export async function GET(req) {
 
   // First, a single unpaged call so the raw response can be inspected — the
   // paging loop hides why a query came back empty.
-  const probe = await postJson(jwt, PAGED_SEARCH_PATH, {
+  let probe = await postJson(jwt, PAGED_SEARCH_PATH, {
     state: states[0], updatedAfter: periodStart, pageNumber: 1,
   });
+
+  // Tracker may invalidate an earlier JWT when a new one is issued. The
+  // tracker-hook exchanges tokens constantly, so this one can be killed
+  // between being issued and being used. One fresh attempt covers that.
+  let retried = false;
+  if (probe.status === 401) {
+    retried = true;
+    jwt = await getJwt();
+    probe = await postJson(jwt, PAGED_SEARCH_PATH, {
+      state: states[0], updatedAfter: periodStart, pageNumber: 1,
+    });
+  }
   meta.probe = {
     sent: { state: states[0], updatedAfter: periodStart, pageNumber: 1 },
     status: probe.status,
@@ -269,6 +290,8 @@ export async function GET(req) {
     payload.debug = {
       elapsedMs: Date.now() - started,
       searchTotal: meta.totalCount,
+      jwtInfo,
+      retriedAfter401: retried,
       probe: meta.probe,
       perState: meta.perState,
       detailsFetched: details.length,
