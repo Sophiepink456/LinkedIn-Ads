@@ -163,7 +163,26 @@ export async function GET(req) {
 
   // Trawl from the start of the period. A job awarded this month will have been
   // touched this month, so updatedAfter is a safe net to cast.
-  const { list: shallow, meta } = await fetchAllPages(jwt, { updatedAfter: periodStart });
+  //
+  // NOTE: PagedSearch returns nothing for updatedAfter on its own — every call
+  // that has worked also carried a state. "open" alone would miss jobs awarded
+  // this month that have since been filled or lost, so each state is queried
+  // and the results combined.
+  const states = (url.searchParams.get("states") || "open,won,closed").split(",").map((s) => s.trim()).filter(Boolean);
+
+  const seen = new Set();
+  const shallow = [];
+  const meta = { perState: {} };
+
+  for (const state of states) {
+    const r = await fetchAllPages(jwt, { state, updatedAfter: periodStart });
+    meta.perState[state] = { returned: r.list.length, totalCount: r.meta.totalCount };
+    for (const o of r.list) {
+      const id = o.opportunityId || o.id;
+      if (id && !seen.has(id)) { seen.add(id); shallow.push(o); }
+    }
+  }
+  meta.totalCount = shallow.length;
 
   const ids = shallow.map((o) => o.opportunityId || o.id).filter(Boolean).slice(0, MAX_DETAILS);
   const details = await fetchDetails(jwt, ids);
