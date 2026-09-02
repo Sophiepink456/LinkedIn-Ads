@@ -76,7 +76,7 @@ async function postJson(jwt, path, body) {
   const text = await res.text();
   let data = null;
   try { data = JSON.parse(text); } catch { /* leave null */ }
-  return { ok: res.ok, status: res.status, data };
+  return { ok: res.ok, status: res.status, data, raw: text.slice(0, 300) };
 }
 
 function asList(data) {
@@ -90,7 +90,7 @@ async function fetchAllPages(jwt, baseBody) {
   let meta = {};
   while (page <= MAX_PAGES) {
     const r = await postJson(jwt, PAGED_SEARCH_PATH, { ...baseBody, pageNumber: page });
-    if (!r.ok) break;
+    if (!r.ok) { meta.failedStatus = r.status; meta.failedBody = r.raw; break; }
     const list = asList(r.data);
     all.push(...list);
     meta = { totalCount: r.data && r.data.totalCount, pagesFetched: page };
@@ -174,9 +174,29 @@ export async function GET(req) {
   const shallow = [];
   const meta = { perState: {} };
 
+  // First, a single unpaged call so the raw response can be inspected — the
+  // paging loop hides why a query came back empty.
+  const probe = await postJson(jwt, PAGED_SEARCH_PATH, {
+    state: states[0], updatedAfter: periodStart, pageNumber: 1,
+  });
+  meta.probe = {
+    sent: { state: states[0], updatedAfter: periodStart, pageNumber: 1 },
+    status: probe.status,
+    ok: probe.ok,
+    keys: probe.data && !Array.isArray(probe.data) ? Object.keys(probe.data) : undefined,
+    totalCount: probe.data && probe.data.totalCount,
+    returned: asList(probe.data).length,
+    raw: probe.ok ? undefined : probe.raw,
+  };
+
   for (const state of states) {
     const r = await fetchAllPages(jwt, { state, updatedAfter: periodStart });
-    meta.perState[state] = { returned: r.list.length, totalCount: r.meta.totalCount };
+    meta.perState[state] = {
+      returned: r.list.length,
+      totalCount: r.meta.totalCount,
+      failedStatus: r.meta.failedStatus,
+      failedBody: r.meta.failedBody,
+    };
     for (const o of r.list) {
       const id = o.opportunityId || o.id;
       if (id && !seen.has(id)) { seen.add(id); shallow.push(o); }
@@ -249,7 +269,8 @@ export async function GET(req) {
     payload.debug = {
       elapsedMs: Date.now() - started,
       searchTotal: meta.totalCount,
-      pagesFetched: meta.pagesFetched,
+      probe: meta.probe,
+      perState: meta.perState,
       detailsFetched: details.length,
       dropdownsFound: rows.length,
       skipped,
