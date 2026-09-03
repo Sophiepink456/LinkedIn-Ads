@@ -19,7 +19,7 @@ const ZAPIER_HOOK =
 
 // Only advertise jobs whose ADVERT is new. Tracker has no "advertised" event,
 // so without this an edit to an old job produces a fresh ad.
-const MAX_ADVERT_AGE_DAYS = 1;
+const MAX_ADVERT_AGE_DAYS = 3;
 
 function findRecordId(body, url) {
   const fromQuery =
