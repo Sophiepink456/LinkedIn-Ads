@@ -1,84 +1,26 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision } from "../../../lib/config";
+import { getOpportunity } from "../../../lib/tracker";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
 // ---------------------------------------------------------------------------
-// Receives Tracker's webhook ping, fetches the job LIVE (not via the search
-// index, which lags by hours), checks whether it is genuinely advertised, and
-// forwards it to Zapier if so.
+// Receives Tracker's webhook ping, fetches the job LIVE, checks whether it is
+// genuinely a NEW advert, and forwards it to Zapier if so.
 //
-// Tracker's payload only says "this record changed" — it carries no job data,
-// so the callback to /Opportunity/{Id} is required.
-//
-// IMPORTANT: Tracker fires on every update, and a job is edited many times
-// over its life. Zapier's Catch Hook does NOT de-duplicate, so the receiving
-// Zap must use Storage by Zapier to check the job id before emailing, or the
-// same ad will go out repeatedly.
+// Uses the shared client in lib/tracker.js, which caches the JWT. Exchanging a
+// token on every ping caused Tracker to reject requests with 401 — each new
+// token appeared to invalidate the last.
 // ---------------------------------------------------------------------------
 
-const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.com";
-const AUTH_PATH = "/api/Auth/ExchangeToken";
-
-// Where qualifying jobs are sent. Override with a ZAPIER_HOOK_URL env var if
-// the Zap is ever rebuilt.
 const ZAPIER_HOOK =
   process.env.ZAPIER_HOOK_URL || "https://hooks.zapier.com/hooks/catch/20911531/4hr9bki/";
 
-// Only advertise jobs whose ADVERT is new.
-//
-// This is the crux of the whole thing. Tracker has no "advertised" event — we
-// trigger on Updated, which fires whenever anyone touches a record. Without a
-// tight age limit, editing a job advertised weeks ago produces a fresh ad,
-// because the system has never seen that job before.
-//
-// 1 day means: advertised today, so genuinely new. A consultant advertising a
-// job and then editing it still gets exactly one ad, because Zapier's Storage
-// step de-duplicates on the job id.
-//
-// Override per-request with ?maxage=N for testing.
+// Only advertise jobs whose ADVERT is new. Tracker has no "advertised" event,
+// so without this an edit to an old job produces a fresh ad.
 const MAX_ADVERT_AGE_DAYS = 1;
 
-function extractJwt(data) {
-  if (!data) return null;
-  if (typeof data === "string") return data.trim() || null;
-  return (
-    data.token || data.jwt || data.accessToken || data.access_token ||
-    data.Token || data.JWT ||
-    (data.data && (data.data.token || data.data.jwt || data.data.accessToken)) || null
-  );
-}
-
-async function getJwt() {
-  const bearer = (process.env.TRACKER_BEARER_TOKEN || "").trim();
-  if (!bearer) throw new Error("TRACKER_BEARER_TOKEN env var is not set");
-  const res = await fetch(TRACKER_BASE + AUTH_PATH, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bearerToken: bearer }),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error("Token exchange failed (" + res.status + "): " + text.slice(0, 300));
-  let data;
-  try { data = JSON.parse(text); } catch { data = text; }
-  const jwt = extractJwt(data);
-  if (!jwt) throw new Error("No JWT returned");
-  return jwt;
-}
-
-async function getOpportunity(jwt, id) {
-  const res = await fetch(TRACKER_BASE + "/api/v1/Opportunity/" + encodeURIComponent(id), {
-    method: "GET",
-    headers: { Authorization: "Bearer " + jwt },
-  });
-  if (!res.ok) return null;
-  const text = await res.text();
-  try { return JSON.parse(text); } catch { return null; }
-}
-
-// Tracker's payload shape is not documented, so look for an id under any of
-// the names it might plausibly use.
 function findRecordId(body, url) {
   const fromQuery =
     url.searchParams.get("id") ||
@@ -95,7 +37,6 @@ function findRecordId(body, url) {
   for (const k of candidates) {
     if (body[k] != null && body[k] !== "") return String(body[k]);
   }
-  // Sometimes nested one level down.
   for (const k of Object.keys(body)) {
     const v = body[k];
     if (v && typeof v === "object") {
@@ -156,8 +97,6 @@ async function handle(req, body) {
   const url = new URL(req.url);
   const token = process.env.SHARE_TOKEN;
 
-  // The webhook URL registered with Tracker carries ?token=... so nobody else
-  // can trigger this endpoint.
   if (token && url.searchParams.get("token") !== token) {
     return new Response("Unauthorized", { status: 401 });
   }
@@ -166,35 +105,26 @@ async function handle(req, body) {
   const maxAge = parseInt(url.searchParams.get("maxage") || "", 10) || MAX_ADVERT_AGE_DAYS;
   const recordId = findRecordId(body, url);
 
+  // Always answer 200 so Tracker does not retry or disable the webhook.
+  const ok = (obj, status) => new Response(JSON.stringify(obj, null, 2), {
+    status: status || 200, headers: { "content-type": "application/json" },
+  });
+
   if (!recordId) {
-    // Always answer 200 so Tracker does not retry or disable the webhook.
-    return new Response(JSON.stringify({
-      ok: true,
-      skipped: "no record id found in payload",
-      received: body,
-    }, null, 2), { status: 200, headers: { "content-type": "application/json" } });
+    return ok({ ok: true, skipped: "no record id found in payload", received: body });
   }
 
-  let jwt, opp;
+  let opp;
   try {
-    jwt = await getJwt();
-    opp = await getOpportunity(jwt, recordId);
+    opp = await getOpportunity(recordId);
   } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: String((e && e.message) || e) }, null, 2), {
-      status: 200, headers: { "content-type": "application/json" },
-    });
+    return ok({ ok: false, id: recordId, error: String((e && e.message) || e) });
   }
 
-  if (!opp) {
-    return new Response(JSON.stringify({ ok: true, id: recordId, skipped: "record not found" }, null, 2), {
-      status: 200, headers: { "content-type": "application/json" },
-    });
-  }
+  if (!opp) return ok({ ok: true, id: recordId, skipped: "record not found" });
 
   const f = mapOpportunity(opp);
 
-  // Same checks as the polling feed, so behaviour does not change — only the
-  // timing does.
   const reasons = [];
   if (!f.advertised) reasons.push("advertStatus is not A — job is not advertised");
   if (f.filled) reasons.push("job is filled");
@@ -202,6 +132,7 @@ async function handle(req, body) {
   if (!f.title) reasons.push("no advert title");
   if (isExcludedDepartment(f.department)) reasons.push("excluded department");
   if (isTestRecord(f.title, f.client)) reasons.push("test or training record");
+
   const advertAge = daysBetween(f.publishDate);
   if (advertAge > maxAge) {
     reasons.push(
@@ -211,18 +142,11 @@ async function handle(req, body) {
   }
 
   if (reasons.length) {
-    return new Response(JSON.stringify({ ok: true, id: recordId, title: f.title, skipped: reasons }, null, 2), {
-      status: 200, headers: { "content-type": "application/json" },
-    });
+    return ok({ ok: true, id: recordId, title: f.title, skipped: reasons });
   }
 
   const payload = buildPayload(f, url.origin, token);
-
-  if (dryRun) {
-    return new Response(JSON.stringify({ ok: true, dryRun: true, wouldSend: payload }, null, 2), {
-      status: 200, headers: { "content-type": "application/json" },
-    });
-  }
+  if (dryRun) return ok({ ok: true, dryRun: true, wouldSend: payload });
 
   let forwarded = { ok: false };
   try {
@@ -236,9 +160,7 @@ async function handle(req, body) {
     forwarded = { ok: false, error: String((e && e.message) || e) };
   }
 
-  return new Response(JSON.stringify({ ok: true, id: recordId, title: f.title, sent: true, forwarded }, null, 2), {
-    status: 200, headers: { "content-type": "application/json" },
-  });
+  return ok({ ok: true, id: recordId, title: f.title, sent: true, forwarded });
 }
 
 export async function POST(req) {
@@ -250,8 +172,6 @@ export async function POST(req) {
   return handle(req, body);
 }
 
-// GET so the endpoint can be tested from a browser:
-//   /api/tracker-hook?token=...&id=44772&dry=1
 export async function GET(req) {
   return handle(req, null);
 }
