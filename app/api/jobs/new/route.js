@@ -84,6 +84,36 @@ export async function GET(req) {
   const days = parseInt(url.searchParams.get("days") || "", 10) || UPDATED_WITHIN_DAYS;
   const pubDays = parseInt(url.searchParams.get("pubdays") || "", 10) || PUBLISHED_WITHIN_DAYS;
 
+  // ?probe=1 — which Tracker calls does this token still allow? Detail fetches
+  // and searches behave differently, so test each and report the status.
+  if (url.searchParams.get("probe") === "1") {
+    const sample = url.searchParams.get("sample") || "44888";
+    const checks = [];
+
+    const detail = await trackerFetch("/api/v1/Opportunity/" + sample);
+    checks.push({ call: "GET /Opportunity/" + sample, status: detail.status, ok: detail.ok, body: detail.ok ? "(record returned)" : detail.raw });
+
+    const paged = await trackerFetch("/api/v1/Opportunity/PagedSearch", {
+      method: "POST", body: { state: "open", pageNumber: 1 },
+    });
+    checks.push({ call: "POST /Opportunity/PagedSearch", status: paged.status, ok: paged.ok, body: paged.ok ? "(returned " + (paged.data && paged.data.totalCount) + " total)" : paged.raw });
+
+    const search = await trackerFetch("/api/v1/Opportunity/Search", {
+      method: "POST", body: { state: "open" },
+    });
+    checks.push({ call: "POST /Opportunity/Search", status: search.status, ok: search.ok, body: search.ok ? "(returned array)" : search.raw });
+
+    const pagedNoState = await trackerFetch("/api/v1/Opportunity/PagedSearch", {
+      method: "POST", body: { pageNumber: 1 },
+    });
+    checks.push({ call: "POST /PagedSearch (no state)", status: pagedNoState.status, ok: pagedNoState.ok, body: pagedNoState.ok ? "(ok)" : pagedNoState.raw });
+
+    const hooks = await trackerFetch("/api/v1/Webhook/List");
+    checks.push({ call: "GET /Webhook/List", status: hooks.status, ok: hooks.ok, body: hooks.ok ? "(ok)" : hooks.raw });
+
+    return json({ checks });
+  }
+
   // ?meta=1 — webhook actions and the registered webhook list.
   if (wantMeta) {
     const out = {};
