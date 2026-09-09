@@ -1,71 +1,31 @@
 import { mapOpportunity } from "../../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision } from "../../../../lib/config";
+import { getOpportunity, pagedSearch, trackerFetch } from "../../../../lib/tracker";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
-const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.com";
-const AUTH_PATH = "/api/Auth/ExchangeToken";
-const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
+// ---------------------------------------------------------------------------
+// The polling feed.
+//
+// IMPORTANT: this now uses the shared client in lib/tracker.js. It used to
+// exchange its own JWT on every call, which invalidated the token the webhook
+// endpoint was using — and vice versa. The two fought each other, producing
+// intermittent 401s and silently empty results.
+//
+// Every route must use the shared client. Do not reintroduce a local
+// getJwt() here.
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Tracker's PagedSearch honours state and updatedAfter, ignores pageSize
-// (always 10) and all sort parameters, and nests results under "opportunities".
-//
-// publishOnline is deliberately NOT used. Despite its label it does not track
-// the website: jobs appear there with it set to false. advertStatus "A" is the
-// signal, with internal test records excluded by name and client instead.
-//
-// Without the publishOnline filter the query returns ~456 records, so the page
-// cap matters — truncated:true in the ?list=1 output warns if it is ever hit.
-// ---------------------------------------------------------------------------
 const UPDATED_WITHIN_DAYS = 14;
 const PUBLISHED_WITHIN_DAYS = 3;
 const MAX_PAGES = 60;
 const MAX_JOBS = 80;
 const MAX_DETAIL_FETCHES = 80;
+const CONCURRENCY = 10;
 
 function daysAgoISO(days) {
   return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
-}
-
-function extractJwt(data) {
-  if (!data) return null;
-  if (typeof data === "string") return data.trim() || null;
-  return (
-    data.token || data.jwt || data.accessToken || data.access_token ||
-    data.Token || data.JWT ||
-    (data.data && (data.data.token || data.data.jwt || data.data.accessToken)) || null
-  );
-}
-
-async function getJwt() {
-  const bearer = (process.env.TRACKER_BEARER_TOKEN || "").trim();
-  if (!bearer) throw new Error("TRACKER_BEARER_TOKEN env var is not set");
-  const res = await fetch(TRACKER_BASE + AUTH_PATH, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bearerToken: bearer }),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error("Token exchange failed (" + res.status + "): " + text.slice(0, 400));
-  let data;
-  try { data = JSON.parse(text); } catch { data = text; }
-  const jwt = extractJwt(data);
-  if (!jwt) throw new Error("Exchange succeeded but no JWT found in: " + text.slice(0, 400));
-  return jwt;
-}
-
-async function postJson(jwt, path, body) {
-  const res = await fetch(TRACKER_BASE + path, {
-    method: "POST",
-    headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
-  const text = await res.text();
-  let data = null;
-  try { data = JSON.parse(text); } catch { /* leave null */ }
-  return { ok: res.ok, status: res.status, text, data };
 }
 
 function asList(data) {
@@ -73,35 +33,38 @@ function asList(data) {
   return (data && (data.opportunities || data.data || data.results || data.items)) || [];
 }
 
-async function fetchAllPages(jwt, baseBody) {
+async function fetchAllPages(baseBody) {
   const all = [];
   let page = 1;
-  let meta = {};
-  let truncated = false;
+  const meta = { pagesFetched: 0, truncated: false };
 
   while (page <= MAX_PAGES) {
-    const r = await postJson(jwt, PAGED_SEARCH_PATH, { ...baseBody, pageNumber: page });
-    if (!r.ok) break;
+    const r = await pagedSearch({ ...baseBody, pageNumber: page });
+    if (!r.ok) {
+      // Surfaced rather than swallowed — an empty list and a failed call used
+      // to look identical, which cost a lot of time.
+      meta.failed = { status: r.status, body: r.raw };
+      break;
+    }
     const list = asList(r.data);
     all.push(...list);
-    meta = { totalCount: r.data && r.data.totalCount, pagesFetched: page };
-
+    meta.pagesFetched = page;
+    meta.totalCount = r.data && r.data.totalCount;
     if (!(r.data && r.data.hasNextPage) || list.length === 0) break;
     page += 1;
-    if (page > MAX_PAGES) truncated = true;
+    if (page > MAX_PAGES) meta.truncated = true;
   }
-
-  return { list: all, meta: { ...meta, truncated } };
+  return { list: all, meta };
 }
 
-async function getOpportunity(jwt, id) {
-  const res = await fetch(TRACKER_BASE + "/api/v1/Opportunity/" + encodeURIComponent(id), {
-    method: "GET",
-    headers: { Authorization: "Bearer " + jwt },
-  });
-  if (!res.ok) return null;
-  const text = await res.text();
-  try { return JSON.parse(text); } catch { return null; }
+async function fetchDetails(ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += CONCURRENCY) {
+    const batch = ids.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(batch.map((id) => getOpportunity(id)));
+    out.push(...results.filter(Boolean));
+  }
+  return out;
 }
 
 export async function GET(req) {
@@ -111,91 +74,54 @@ export async function GET(req) {
     return new Response("Unauthorized", { status: 401 });
   }
 
+  const json = (obj, status) => new Response(JSON.stringify(obj, null, 2), {
+    status: status || 200, headers: { "content-type": "application/json" },
+  });
+
   const jobId = url.searchParams.get("job");
   const wantList = url.searchParams.get("list") === "1";
+  const wantMeta = url.searchParams.get("meta") === "1";
   const days = parseInt(url.searchParams.get("days") || "", 10) || UPDATED_WITHIN_DAYS;
   const pubDays = parseInt(url.searchParams.get("pubdays") || "", 10) || PUBLISHED_WITHIN_DAYS;
 
-  let jwt;
-  try {
-    jwt = await getJwt();
-  } catch (e) {
-    return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
-      status: 502, headers: { "content-type": "application/json" },
-    });
-  }
-
-  // ?meta=1 — asks Tracker which webhook actions and record types exist, so we
-  // know the valid values for creating one. Tracker documents these fields as
-  // free-text strings, so this endpoint is the only way to find out.
-  if (url.searchParams.get("meta") === "1") {
+  // ?meta=1 — webhook actions and the registered webhook list.
+  if (wantMeta) {
     const out = {};
-    for (const path of [
-      "/api/v1/Webhook/Meta/Actions",
-      "/api/v1/Webhook/Meta/RecordTypes",
-      "/api/v1/Webhook/List",
-    ]) {
-      const r = await fetch(TRACKER_BASE + path, {
-        method: "GET",
-        headers: { Authorization: "Bearer " + jwt },
-      });
-      const text = await r.text();
-      try { out[path] = { status: r.status, body: JSON.parse(text) }; }
-      catch { out[path] = { status: r.status, body: text.slice(0, 500) }; }
+    for (const path of ["/api/v1/Webhook/Meta/Actions", "/api/v1/Webhook/List"]) {
+      const r = await trackerFetch(path);
+      out[path] = { status: r.status, body: r.ok ? r.data : r.raw };
     }
-    return new Response(JSON.stringify(out, null, 2), {
-      headers: { "content-type": "application/json" },
-    });
+    return json(out);
   }
 
-  // ?register=1 — creates the Tracker webhooks that point at /api/tracker-hook.
-  // Registers Opportunity + Created and Opportunity + Updated. Add &undo=1 to
-  // delete them again.
+  // ?register=1 — (re)create the Tracker webhooks pointing at /api/tracker-hook.
   if (url.searchParams.get("register") === "1") {
     const hookUrl = url.origin + "/api/tracker-hook?token=" + encodeURIComponent(token || "");
     const results = [];
     for (const action of ["Created", "Updated"]) {
-      const r = await fetch(TRACKER_BASE + "/api/v1/Webhook", {
+      const r = await trackerFetch("/api/v1/Webhook", {
         method: "POST",
-        headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
-        body: JSON.stringify({ url: hookUrl, action, recordType: "Opportunity" }),
+        body: { url: hookUrl, action, recordType: "Opportunity" },
       });
-      const text = await r.text();
-      let body;
-      try { body = JSON.parse(text); } catch { body = text.slice(0, 300); }
-      results.push({ action, status: r.status, ok: r.ok, body });
+      results.push({ action, status: r.status, ok: r.ok, body: r.ok ? r.data : r.raw });
     }
-    return new Response(JSON.stringify({ hookUrl, results }, null, 2), {
-      headers: { "content-type": "application/json" },
-    });
+    return json({ hookUrl, results });
   }
 
   if (jobId) {
-    const opp = await getOpportunity(jwt, jobId);
-    if (!opp) {
-      return new Response(JSON.stringify({ error: "No record found for id " + jobId }, null, 2), {
-        status: 404, headers: { "content-type": "application/json" },
-      });
-    }
-    if (url.searchParams.get("mapped") === "1") {
-      return new Response(JSON.stringify(mapOpportunity(opp), null, 2), {
-        headers: { "content-type": "application/json" },
-      });
-    }
-    return new Response(JSON.stringify(opp, null, 2), {
-      headers: { "content-type": "application/json" },
-    });
+    const opp = await getOpportunity(jobId);
+    if (!opp) return json({ error: "No record found for id " + jobId }, 404);
+    if (url.searchParams.get("mapped") === "1") return json(mapOpportunity(opp));
+    return json(opp);
   }
 
-  // ?nostate=1 drops the state filter. Tracker's search index appears to lag
-  // behind newly created records, and the state filter may make that worse —
-  // this lets us compare what each query actually returns.
-  const noState = url.searchParams.get("nostate") === "1";
-  const query = noState
-    ? { updatedAfter: daysAgoISO(days) }
-    : { state: "open", updatedAfter: daysAgoISO(days) };
+  const query = { state: "open", updatedAfter: daysAgoISO(days) };
+  const { list: shallow, meta } = await fetchAllPages(query);
 
-  const { list: shallow, meta } = await fetchAllPages(jwt, query);
+  // If the search itself failed, say so loudly rather than returning [].
+  if (meta.failed) {
+    return json({ error: "Tracker search failed", query, ...meta }, 502);
+  }
 
   const publishedCutoff = daysAgoISO(pubDays);
   const recent = shallow
@@ -203,40 +129,31 @@ export async function GET(req) {
     .sort((a, b) => String(b.publishDate || "").localeCompare(String(a.publishDate || "")));
 
   if (wantList) {
-    return new Response(JSON.stringify({
+    return json({
       query,
       publishedOnOrAfter: publishedCutoff,
       ...meta,
       matchedUpdateWindow: shallow.length,
       matchedPublishWindow: recent.length,
-      // ?find=44770 reports whether a specific job came back from the search.
-      find: url.searchParams.get("find") ? {
-        id: url.searchParams.get("find"),
-        inSearchResults: shallow.some((o) => String(o.opportunityId || o.id) === url.searchParams.get("find")),
-        inPublishWindow: recent.some((o) => String(o.opportunityId || o.id) === url.searchParams.get("find")),
-      } : undefined,
       rows: recent.map((o) => ({
         id: o.opportunityId || o.id,
         title: o.publishTitle || o.opportunityName || o.name,
         status: o.opportunityStatusDesc,
         advertStatus: o.advertStatus,
-        publishOnline: o.publishOnline,
         publishDate: o.publishDate,
       })),
-    }, null, 2), { headers: { "content-type": "application/json" } });
+    });
   }
 
   const ids = recent.map((o) => o.opportunityId || o.id).filter(Boolean).slice(0, MAX_DETAIL_FETCHES);
-  const details = await Promise.all(ids.map((id) => getOpportunity(jwt, id)));
+  const details = await fetchDetails(ids);
 
   const origin = url.origin;
 
   const jobs = details
-    .filter(Boolean)
     .map((opp) => mapOpportunity(opp))
     .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
     .filter((f) => !isExcludedDepartment(f.department))
-    // Internal test and training records — see config.js.
     .filter((f) => !isTestRecord(f.title, f.client))
     .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
     .slice(0, MAX_JOBS)
@@ -264,7 +181,6 @@ export async function GET(req) {
         id: f.id,
         title: f.title,
         consultant: f.consultant,
-        // Ready for when the emails go to consultants rather than to you.
         consultantEmail: f.consultantEmail,
         consultantSource: f.consultantSource,
         department: f.department,
@@ -280,7 +196,5 @@ export async function GET(req) {
       };
     });
 
-  return new Response(JSON.stringify(jobs), {
-    headers: { "content-type": "application/json" },
-  });
+  return json(jobs);
 }
