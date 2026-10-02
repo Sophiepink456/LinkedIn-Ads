@@ -302,7 +302,7 @@ export async function GET(req) {
     // Mirror the webhook's filters exactly. Anything the webhook would never
     // send must NOT be seeded, or a genuinely new advert could later be
     // silenced by a key we pre-loaded for no reason.
-    if (!f.advertised || f.filled || f.closed || !f.title) { skipped.push({ id: f.id, why: "not a live advert" }); continue; }
+    if (!f.advertised || f.dead || !f.title) { skipped.push({ id: f.id, why: f.dead ? ("status " + f.status) : "not a live advert" }); continue; }
     if (isExcludedDepartment(f.department)) { skipped.push({ id: f.id, why: "excluded department" }); continue; }
     if (isTestRecord(f.title, f.client)) { skipped.push({ id: f.id, why: "test record" }); continue; }
 
