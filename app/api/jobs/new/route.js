@@ -1,5 +1,5 @@
 import { mapOpportunity } from "../../../../lib/mapping";
-import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision } from "../../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor } from "../../../../lib/config";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -260,10 +260,24 @@ export async function GET(req) {
       const competitive = new URLSearchParams(base);
       competitive.set("salary_text", COMPETITIVE_LABEL);
 
+      // Everyone who should receive this advert: the consultant, their desk
+      // partner, the resourcers covering the area, and Sophie on CC.
+      const recipients = recipientsFor({
+        consultant: f.consultant,
+        consultantEmail: f.consultantEmail,
+        department: f.department,
+        division,
+      });
+
       return {
         id: f.id,
         title: f.title,
         consultant: f.consultant,
+        // Map these straight into the Gmail step's To and CC fields.
+        emailTo: recipients.to.join(", "),
+        emailCc: recipients.cc.join(", "),
+        // Names with no address on file — nobody is silently dropped.
+        emailMissing: recipients.missing.join(", "),
         // Ready for when the emails go to consultants rather than to you.
         consultantEmail: f.consultantEmail,
         consultantSource: f.consultantSource,
