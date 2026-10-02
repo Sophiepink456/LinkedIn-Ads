@@ -1,5 +1,5 @@
 import { ImageResponse } from "next/og";
-import { GREEN, PHOTO_BASE_URL, BACKGROUNDS, resolveDivision, resolveType } from "../../../lib/config";
+import { GREEN, PHOTO_BASE_URL, backgroundsFor, resolveDivision, resolveType } from "../../../lib/config";
 import { formatSalary, parseRange } from "../../../lib/salary";
 
 export const runtime = "edge";
@@ -24,9 +24,13 @@ function resolveImage(origin, file) {
   return base + file;
 }
 
-function pickBackground(origin, param) {
+// Picks a background at random from the pool for this division. Leadership &
+// Executive has its own set; everything else uses the general one. An explicit
+// ?image=filename still overrides both, which is what the manual form uses.
+function pickBackground(origin, param, division) {
   if (param && param !== "auto") return resolveImage(origin, param);
-  const f = BACKGROUNDS[Math.floor(Math.random() * BACKGROUNDS.length)];
+  const pool = backgroundsFor(division);
+  const f = pool[Math.floor(Math.random() * pool.length)];
   return resolveImage(origin, f);
 }
 
@@ -77,7 +81,9 @@ export async function GET(req) {
     searchParams.get("employment_type"),
     searchParams.get("working_pattern")
   );
-  const bg = pickBackground(origin, searchParams.get("image"));
+  // `sector` is the resolved division, so the exec pool is picked up whether it
+  // came from the department or from a consultant override.
+  const bg = pickBackground(origin, searchParams.get("image"), sector);
   const locSalary = [location, salary, typeLabel].filter(Boolean).join(" | ");
 
   const [bold, semiBold] = await Promise.all([
