@@ -1,5 +1,5 @@
 import { mapOpportunity } from "../../../../lib/mapping";
-import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor } from "../../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor, dedupeKeyFor } from "../../../../lib/config";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -25,6 +25,31 @@ const MAX_PAGES = 60;
 const MAX_JOBS = 80;
 const MAX_DETAIL_FETCHES = 80;
 
+// ---------------------------------------------------------------------------
+// De-duplication key. Zapier stores this and blocks anything it has seen.
+//
+// It is built from three things: the job id, the publish date, and a short
+// fingerprint of everything that actually appears ON the advert.
+//
+//   45175-2026-10-01-k3f9c1
+//   ^^^^^ ^^^^^^^^^^ ^^^^^^
+//   job   published   what the ad says
+//
+// So:
+//   * re-advertised later      -> publish date moves  -> new key -> new ad
+//   * salary or title changed  -> fingerprint moves   -> new key -> new ad
+//   * notes, status, owner's
+//     internal fields changed  -> nothing on the ad
+//                                 moves              -> same key -> silent
+//
+// De-duplicating on the id alone blocked a re-advertise forever. Dropping
+// de-duplication entirely sent an email on every single Tracker edit, which
+// was the September complaint. This is the middle ground: an email whenever
+// the advert would genuinely look different, and silence otherwise.
+//
+// Kept deliberately short — Storage by Zapier limits keys to 32 characters,
+// and this comes to 24 at most.
+// ---------------------------------------------------------------------------
 function daysAgoISO(days) {
   return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
 }
@@ -271,6 +296,8 @@ export async function GET(req) {
 
       return {
         id: f.id,
+        // Use THIS as the de-duplication key in Zapier, not id.
+        dedupeKey: dedupeKeyFor(f, division),
         title: f.title,
         consultant: f.consultant,
         // Map these straight into the Gmail step's To and CC fields.
