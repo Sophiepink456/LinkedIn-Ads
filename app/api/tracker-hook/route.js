@@ -168,8 +168,9 @@ async function handle(req, body) {
 
   const reasons = [];
   if (!f.advertised) reasons.push("advertStatus is not A — job is not advertised");
-  if (f.filled) reasons.push("job is filled");
-  if (f.closed) reasons.push("job is closed");
+  // Current pipeline status, not the historical filled date — a job filled in
+  // July and re-advertised in October must still get an ad.
+  if (f.dead) reasons.push("status is " + (f.status || "(none)") + " — not advertising");
   if (!f.title) reasons.push("no advert title");
   if (isExcludedDepartment(f.department)) reasons.push("excluded department");
   if (isTestRecord(f.title, f.client)) reasons.push("test or training record");
