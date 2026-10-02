@@ -101,18 +101,69 @@ function storeSecret() {
   return s;
 }
 
+// Zapier accepts the secret as ?secret= or as an X-Secret header. Writes sent
+// with the header alone came back 201, echoing the data, but every read then
+// returned an empty store — so the two were not landing in the same place.
+// Both forms are now sent on every request, which costs nothing and removes
+// the ambiguity. ?mode=diag proves which combination actually round-trips.
+function storeUrl() {
+  return STORE_URL + "?secret=" + encodeURIComponent(storeSecret());
+}
+
 async function storeGet() {
-  const res = await fetch(STORE_URL, { headers: { "X-Secret": storeSecret() } });
+  const res = await fetch(storeUrl(), { headers: { "X-Secret": storeSecret() } });
   const text = await res.text();
   if (!res.ok) throw new Error("Store read failed (" + res.status + "): " + text.slice(0, 300));
   try { return JSON.parse(text); } catch { return {}; }
+}
+
+// Writes a probe key four ways and reads it back after each, so we can see
+// exactly which transport Zapier honours rather than inferring it from a
+// status code that is 201 either way.
+async function storeDiag() {
+  const secret = storeSecret();
+  const probe = "diag-" + Date.now().toString(36).slice(-5);
+  const out = [];
+
+  const attempts = [
+    { name: "query param only", url: STORE_URL + "?secret=" + encodeURIComponent(secret), headers: {} },
+    { name: "header only",      url: STORE_URL,                                            headers: { "X-Secret": secret } },
+    { name: "both",             url: STORE_URL + "?secret=" + encodeURIComponent(secret), headers: { "X-Secret": secret } },
+  ];
+
+  for (const a of attempts) {
+    const key = probe + "-" + a.name.replace(/[^a-z]/g, "").slice(0, 6);
+    let put = {};
+    try {
+      const r = await fetch(a.url, {
+        method: "POST",
+        headers: { ...a.headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ [key]: "probe" }),
+      });
+      put = { status: r.status, body: (await r.text()).slice(0, 160) };
+    } catch (e) { put = { error: String((e && e.message) || e) }; }
+
+    // read it back the same way it was written
+    let readBack = {};
+    try {
+      const r = await fetch(a.url, { headers: a.headers });
+      const text = await r.text();
+      let obj = {};
+      try { obj = JSON.parse(text); } catch { /* leave empty */ }
+      readBack = { status: r.status, keyCount: Object.keys(obj).length, foundProbe: Object.prototype.hasOwnProperty.call(obj, key) };
+    } catch (e) { readBack = { error: String((e && e.message) || e) }; }
+
+    out.push({ transport: a.name, wrote: key, put, readBack });
+  }
+
+  return { probe, secretLength: secret.length, attempts: out };
 }
 
 // POST merges the given keys into whatever is already there; it does not
 // replace the store. Checked against Zapier's API docs before writing this,
 // because a replace would have wiped the live de-duplication state.
 async function storePut(pairs) {
-  const res = await fetch(STORE_URL, {
+  const res = await fetch(storeUrl(), {
     method: "POST",
     headers: { "X-Secret": storeSecret(), "Content-Type": "application/json" },
     body: JSON.stringify(pairs),
@@ -131,6 +182,12 @@ export async function GET(req) {
   }
 
   const mode = url.searchParams.get("mode") || "peek";
+
+  // ---- diag: which transport actually round-trips? ----------------------
+  if (mode === "diag") {
+    try { return json(await storeDiag()); }
+    catch (e) { return json({ error: String((e && e.message) || e) }); }
+  }
 
   // ---- peek -----------------------------------------------------------
   if (mode === "peek") {
