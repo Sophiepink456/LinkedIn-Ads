@@ -1,5 +1,5 @@
 import { mapOpportunity } from "../../../lib/mapping";
-import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor } from "../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor, dedupeKeyFor } from "../../../lib/config";
 import { getOpportunity } from "../../../lib/tracker";
 
 export const runtime = "edge";
@@ -17,9 +17,27 @@ export const dynamic = "force-dynamic";
 const ZAPIER_HOOK =
   process.env.ZAPIER_HOOK_URL || "https://hooks.zapier.com/hooks/catch/20911531/4hr9bki/";
 
-// Only advertise jobs whose ADVERT is new. Tracker has no "advertised" event,
-// so without this an edit to an old job produces a fresh ad.
-const MAX_ADVERT_AGE_DAYS = 3;
+// ---------------------------------------------------------------------------
+// Tracker fires a webhook on EVERY change to an opportunity, including changes
+// to jobs that were advertised long before this automation existed. Those jobs
+// are still open and still advertStatus "A", so without a floor, touching a
+// job from February would email an ad nobody is waiting for.
+//
+// This was a rolling 3-day window, which blocked late corrections — a salary
+// fixed a month after advertising never reached anyone.
+//
+// Be clear about how much this gate is worth now: because Tracker bumps
+// publishDate when a live record is saved, an advert from March jumps to
+// today the moment anyone touches it and sails past any cut-off. The gate
+// only catches adverts whose publishDate has NOT been bumped. The real
+// protection against repeat ads is the fingerprint key above.
+//
+// It is kept as a cheap backstop, set loose enough not to block corrections:
+// 1 September 2026 is when this automation's webhook was registered, so
+// everything it has ever handled stays eligible. Override per-request with
+// ?from= or set ADVERTS_PUBLISHED_FROM in Vercel.
+// ---------------------------------------------------------------------------
+const ADVERTS_PUBLISHED_FROM = process.env.ADVERTS_PUBLISHED_FROM || "2026-09-01";
 
 function findRecordId(body, url) {
   const fromQuery =
@@ -48,13 +66,17 @@ function findRecordId(body, url) {
   return null;
 }
 
-function daysBetween(dateStr) {
-  const t = Date.parse(dateStr);
-  if (isNaN(t)) return Infinity;
-  return (Date.now() - t) / 86400000;
+
+// Tracker publish dates arrive as "2026-10-01T09:14:00". Comparing the first
+// ten characters as strings is enough for an ISO date and avoids timezone
+// drift around midnight. A blank publish date sorts below any floor, so a
+// record with no publish date is treated as not advertised — which is right,
+// because we cannot tell when it went out.
+function publishedOnOrAfter(publishDate, floor) {
+  return String(publishDate || "").slice(0, 10) >= floor;
 }
 
-function buildPayload(f, origin, token) {
+function buildPayload(f, origin, token, force) {
   const division = resolveDivision(f.department, f.consultant);
 
   const base = new URLSearchParams();
@@ -85,6 +107,8 @@ function buildPayload(f, origin, token) {
 
   return {
     id: f.id,
+    // Use THIS as the de-duplication key in Zapier, not id.
+    dedupeKey: dedupeKeyFor(f, division, force),
     title: f.title,
     consultant: f.consultant,
     consultantEmail: f.consultantEmail,
@@ -116,7 +140,10 @@ async function handle(req, body) {
   }
 
   const dryRun = url.searchParams.get("dry") === "1";
-  const maxAge = parseInt(url.searchParams.get("maxage") || "", 10) || MAX_ADVERT_AGE_DAYS;
+  const floor = url.searchParams.get("from") || ADVERTS_PUBLISHED_FROM;
+  // ?force=1 — send this ad even if Zapier has already seen it. Skips the
+  // publish-date gate too, so an old advert can be re-sent on request.
+  const force = url.searchParams.get("force") === "1";
   const recordId = findRecordId(body, url);
 
   // Always answer 200 so Tracker does not retry or disable the webhook.
@@ -147,11 +174,10 @@ async function handle(req, body) {
   if (isExcludedDepartment(f.department)) reasons.push("excluded department");
   if (isTestRecord(f.title, f.client)) reasons.push("test or training record");
 
-  const advertAge = daysBetween(f.publishDate);
-  if (advertAge > maxAge) {
+  if (!force && !publishedOnOrAfter(f.publishDate, floor)) {
     reasons.push(
-      "advert published " + Math.round(advertAge) + " days ago (limit " + maxAge +
-      ") — this is an edit to an existing advert, not a new one"
+      "advert published " + (String(f.publishDate || "").slice(0, 10) || "(no date)") +
+      ", before the " + floor + " cut-off — this advert predates the automation"
     );
   }
 
@@ -159,7 +185,7 @@ async function handle(req, body) {
     return ok({ ok: true, id: recordId, title: f.title, skipped: reasons });
   }
 
-  const payload = buildPayload(f, url.origin, token);
+  const payload = buildPayload(f, url.origin, token, force);
   if (dryRun) return ok({ ok: true, dryRun: true, wouldSend: payload });
 
   let forwarded = { ok: false };
