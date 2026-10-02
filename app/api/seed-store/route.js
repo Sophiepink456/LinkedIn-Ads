@@ -6,26 +6,26 @@ export const dynamic = "force-dynamic";
 
 // ---------------------------------------------------------------------------
 // ONE-OFF: pre-loads Zapier's Storage with the de-duplication key of every
-// advert that is currently live in Tracker, so that switching the Zap over to
-// the new key does not make hundreds of existing adverts look brand new.
+// advert currently live in Tracker, so switching the Zap to the new key does
+// not make hundreds of existing adverts look brand new.
 //
-// Run order — do NOT skip straight to write:
+// v2. The first version re-walked the whole opportunity search on every call
+// and timed out. Tracker's PagedSearch ignores pageSize and always returns 10
+// records a page, so a wide window is hundreds of requests. Everything is now
+// bounded: listing pages and writing records are separate calls, and each one
+// is told exactly how much to do.
 //
-//   ?mode=peek                     what is in the store right now
-//   ?mode=plan                     what WOULD be written (no writes)
-//   ?mode=write&confirm=yes        actually write it
+//   ?mode=peek                          what is in the store
+//   ?mode=ids&page=1&pages=25           list advertised ids, 25 pages at a time
+//   ?mode=plan&ids=1,2,3                keys those ids would get (no writes)
+//   ?mode=write&ids=1,2,3&confirm=yes   write them
 //
-// Both plan and write work in slices. Start at offset=0 and follow the
-// nextOffset in each response until it comes back null.
+// Storage by Zapier's limits, which shape all of this:
+//   500 values per secret · 32 chars per key · 2500 bytes per value
+//   values untouched for 2 months are pruned
 //
-// Storage by Zapier's documented limits, which shape all of this:
-//   * 500 values per secret   <- the binding constraint; peek reports headroom
-//   * 32 characters per key   <- our keys are ~13
-//   * 2500 bytes per value    <- we store a short marker
-//   * values untouched for 2 months are pruned
-//
-// The secret never passes through a URL or a log. It is read from the
-// ZAPIER_STORE_SECRET environment variable and sent to Zapier in a header.
+// The secret is read from ZAPIER_STORE_SECRET and sent in a header, so it
+// never appears in a URL or a log.
 // ---------------------------------------------------------------------------
 
 const TRACKER_BASE = process.env.TRACKER_BASE || "https://evoglapi.tracker-rms.com";
@@ -34,10 +34,10 @@ const PAGED_SEARCH_PATH = "/api/v1/Opportunity/PagedSearch";
 const STORE_URL = "https://store.zapier.com/api/records";
 
 const STORE_MAX_VALUES = 500;
-const DEFAULT_LIMIT = 40;      // detail fetches per slice — keeps us inside the
-                               // edge runtime's time budget
-const DEFAULT_DAYS = 400;      // wide enough to mean "everything still open"
-const MAX_PAGES = 120;         // PagedSearch always returns 10 per page
+const DEFAULT_DAYS = 400;
+const DEFAULT_PAGES = 25;    // ~10 records a page; keeps one call well inside
+                             // the edge runtime's time budget
+const MAX_IDS_PER_CALL = 40;
 
 function json(obj, status) {
   return new Response(JSON.stringify(obj, null, 2), {
@@ -84,42 +84,6 @@ function asList(data) {
   return (data && (data.opportunities || data.data || data.results || data.items)) || [];
 }
 
-// Walks every page of the open-opportunity search and keeps the rows that are
-// actually advertised. advertStatus is the signal, not publishOnline — see the
-// note in lib/mapping.js.
-async function candidateIds(jwt, days) {
-  const all = [];
-  let page = 1;
-  let totalCount = null;
-  let truncated = false;
-
-  while (page <= MAX_PAGES) {
-    const res = await fetch(TRACKER_BASE + PAGED_SEARCH_PATH, {
-      method: "POST",
-      headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
-      body: JSON.stringify({ state: "open", updatedAfter: daysAgoISO(days), pageNumber: page }),
-    });
-    if (!res.ok) break;
-    let data = null;
-    try { data = JSON.parse(await res.text()); } catch { break; }
-
-    const rows = asList(data);
-    if (totalCount == null) totalCount = data && data.totalCount;
-    all.push(...rows);
-
-    if (!(data && data.hasNextPage) || rows.length === 0) break;
-    page += 1;
-    if (page > MAX_PAGES) truncated = true;
-  }
-
-  const advertised = all.filter((o) => String(o.advertStatus || "").trim().toUpperCase() === "A");
-
-  return {
-    ids: advertised.map((o) => o.opportunityId || o.id).filter(Boolean).map(String),
-    meta: { totalCount, pagesFetched: page, truncated, seen: all.length, advertised: advertised.length },
-  };
-}
-
 async function getOpportunity(jwt, id) {
   const res = await fetch(TRACKER_BASE + "/api/v1/Opportunity/" + encodeURIComponent(id), {
     method: "GET",
@@ -144,10 +108,9 @@ async function storeGet() {
   try { return JSON.parse(text); } catch { return {}; }
 }
 
-// POST merges the keys given into whatever is already there — it does not
-// replace the store. Confirmed against Zapier's own API documentation before
-// this was written, because a replace would have wiped the live de-duplication
-// state.
+// POST merges the given keys into whatever is already there; it does not
+// replace the store. Checked against Zapier's API docs before writing this,
+// because a replace would have wiped the live de-duplication state.
 async function storePut(pairs) {
   const res = await fetch(STORE_URL, {
     method: "POST",
@@ -168,19 +131,16 @@ export async function GET(req) {
   }
 
   const mode = url.searchParams.get("mode") || "peek";
-  const offset = parseInt(url.searchParams.get("offset") || "0", 10) || 0;
-  const limit = parseInt(url.searchParams.get("limit") || "", 10) || DEFAULT_LIMIT;
-  const days = parseInt(url.searchParams.get("days") || "", 10) || DEFAULT_DAYS;
 
-  // ---- peek: read-only look at the store ----------------------------------
+  // ---- peek -----------------------------------------------------------
   if (mode === "peek") {
     let store;
     try { store = await storeGet(); }
-    catch (e) { return json({ error: String((e && e.message) || e) }, 502); }
+    catch (e) { return json({ error: String((e && e.message) || e) }, 200); }
 
     const keys = Object.keys(store);
     const sample = {};
-    for (const k of keys.slice(0, 15)) sample[k] = store[k];
+    for (const k of keys.slice(0, 10)) sample[k] = store[k];
 
     return json({
       mode: "peek",
@@ -188,28 +148,91 @@ export async function GET(req) {
       limit: STORE_MAX_VALUES,
       headroom: STORE_MAX_VALUES - keys.length,
       longestKey: keys.reduce((m, k) => Math.max(m, k.length), 0),
-      // Tells us which scheme the live Zap is using right now.
       keysLookLikeNewScheme: keys.filter((k) => /^\d+-[0-9a-z]{4,8}$/.test(k)).length,
       keysLookLikeBareId: keys.filter((k) => /^\d+$/.test(k)).length,
       sample,
     });
   }
 
-  if (mode !== "plan" && mode !== "write") {
-    return json({ error: 'mode must be peek, plan or write' }, 400);
-  }
-  if (mode === "write" && url.searchParams.get("confirm") !== "yes") {
-    return json({ error: 'write requires &confirm=yes' }, 400);
-  }
-
   let jwt;
   try { jwt = await getJwt(); }
-  catch (e) { return json({ error: String((e && e.message) || e) }, 502); }
+  catch (e) { return json({ error: String((e && e.message) || e) }, 200); }
 
-  const { ids, meta } = await candidateIds(jwt, days);
-  const slice = ids.slice(offset, offset + limit);
+  // ---- ids: walk a bounded number of search pages ----------------------
+  if (mode === "ids") {
+    const startPage = parseInt(url.searchParams.get("page") || "1", 10) || 1;
+    const pages = Math.min(parseInt(url.searchParams.get("pages") || "", 10) || DEFAULT_PAGES, 40);
+    const days = parseInt(url.searchParams.get("days") || "", 10) || DEFAULT_DAYS;
 
-  const details = await Promise.all(slice.map((id) => getOpportunity(jwt, id)));
+    // &filter=1 asks Tracker to do the advertStatus filtering server-side.
+    // Undocumented, so compare totalCount with and without before trusting it.
+    const useFilter = url.searchParams.get("filter") === "1";
+    const query = { state: "open", updatedAfter: daysAgoISO(days) };
+    if (useFilter) query.advertStatus = "A";
+
+    const advertised = [];
+    let seen = 0;
+    let totalCount = null;
+    let page = startPage;
+    let hasMore = false;
+    let lastPage = startPage - 1;
+
+    for (let n = 0; n < pages; n++) {
+      const res = await fetch(TRACKER_BASE + PAGED_SEARCH_PATH, {
+        method: "POST",
+        headers: { Authorization: "Bearer " + jwt, "Content-Type": "application/json" },
+        body: JSON.stringify({ ...query, pageNumber: page }),
+      });
+      if (!res.ok) break;
+      let data = null;
+      try { data = JSON.parse(await res.text()); } catch { break; }
+
+      const rows = asList(data);
+      if (totalCount == null) totalCount = data && data.totalCount;
+      seen += rows.length;
+      lastPage = page;
+
+      for (const o of rows) {
+        if (String(o.advertStatus || "").trim().toUpperCase() === "A") {
+          const id = o.opportunityId || o.id;
+          if (id) advertised.push(String(id));
+        }
+      }
+
+      hasMore = !!(data && data.hasNextPage) && rows.length > 0;
+      if (!hasMore) break;
+      page += 1;
+    }
+
+    return json({
+      mode: "ids",
+      query,
+      totalCount,
+      pagesWalked: lastPage - startPage + 1,
+      fromPage: startPage,
+      lastPage,
+      seen,
+      advertisedCount: advertised.length,
+      hasMore,
+      nextPage: hasMore ? lastPage + 1 : null,
+      ids: advertised,
+    });
+  }
+
+  // ---- plan / write: explicit id list ----------------------------------
+  if (mode !== "plan" && mode !== "write") {
+    return json({ error: "mode must be peek, ids, plan or write" }, 400);
+  }
+  if (mode === "write" && url.searchParams.get("confirm") !== "yes") {
+    return json({ error: "write requires &confirm=yes" }, 400);
+  }
+
+  const ids = (url.searchParams.get("ids") || "")
+    .split(",").map((s) => s.trim()).filter(Boolean).slice(0, MAX_IDS_PER_CALL);
+
+  if (!ids.length) return json({ error: "pass &ids=1,2,3 (max " + MAX_IDS_PER_CALL + ")" }, 400);
+
+  const details = await Promise.all(ids.map((id) => getOpportunity(jwt, id)));
 
   const pairs = {};
   const rows = [];
@@ -219,9 +242,9 @@ export async function GET(req) {
     if (!opp) continue;
     const f = mapOpportunity(opp);
 
-    // Mirror the webhook's own filters exactly. Anything the webhook would
-    // never send must NOT be seeded, or a genuinely new advert could be
-    // silenced later by a key we pre-loaded for no reason.
+    // Mirror the webhook's filters exactly. Anything the webhook would never
+    // send must NOT be seeded, or a genuinely new advert could later be
+    // silenced by a key we pre-loaded for no reason.
     if (!f.advertised || f.filled || f.closed || !f.title) { skipped.push({ id: f.id, why: "not a live advert" }); continue; }
     if (isExcludedDepartment(f.department)) { skipped.push({ id: f.id, why: "excluded department" }); continue; }
     if (isTestRecord(f.title, f.client)) { skipped.push({ id: f.id, why: "test record" }); continue; }
@@ -229,29 +252,23 @@ export async function GET(req) {
     const division = resolveDivision(f.department, f.consultant);
     const key = dedupeKeyFor(f, division);
     pairs[key] = "seeded-" + new Date().toISOString().slice(0, 10);
-    rows.push({ id: f.id, title: f.title, key });
+    rows.push({ id: f.id, key, title: f.title });
   }
-
-  const nextOffset = offset + limit < ids.length ? offset + limit : null;
 
   const out = {
     mode,
-    tracker: meta,
-    candidates: ids.length,
-    sliceRange: offset + "-" + Math.min(offset + limit, ids.length),
+    asked: ids.length,
     wouldWrite: Object.keys(pairs).length,
     skipped: skipped.length,
     skippedDetail: skipped.slice(0, 10),
     rows,
-    nextOffset,
   };
 
   if (mode === "plan") return json(out);
 
-  // Guard against blowing the 500-value ceiling half way through.
   let existing = 0;
   try { existing = Object.keys(await storeGet()).length; }
-  catch (e) { return json({ error: "could not read store before writing: " + String((e && e.message) || e) }, 502); }
+  catch (e) { return json({ error: "could not read store before writing: " + String((e && e.message) || e) }, 200); }
 
   if (existing + Object.keys(pairs).length > STORE_MAX_VALUES) {
     return json({
@@ -260,10 +277,12 @@ export async function GET(req) {
       reason: "would exceed Storage by Zapier's " + STORE_MAX_VALUES + "-value limit",
       valuesStored: existing,
       headroom: STORE_MAX_VALUES - existing,
-    }, 409);
+    });
   }
 
-  const written = Object.keys(pairs).length ? await storePut(pairs) : { ok: true, status: 204, body: "nothing to write" };
+  const written = Object.keys(pairs).length
+    ? await storePut(pairs)
+    : { ok: true, status: 204, body: "nothing to write" };
 
-  return json({ ...out, written, valuesStoredBefore: existing });
+  return json({ ...out, written, valuesStoredBefore: existing, valuesStoredAfter: existing + Object.keys(pairs).length });
 }
