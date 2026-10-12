@@ -172,6 +172,14 @@ async function storePut(pairs) {
   return { ok: res.ok, status: res.status, body: text.slice(0, 300) };
 }
 
+async function storeDelete(key) {
+  const res = await fetch(
+    STORE_URL + "?secret=" + encodeURIComponent(storeSecret()) + "&key=" + encodeURIComponent(key),
+    { method: "DELETE", headers: { "X-Secret": storeSecret() } }
+  );
+  return { ok: res.ok, status: res.status };
+}
+
 // --- route -----------------------------------------------------------------
 
 export async function GET(req) {
@@ -214,6 +222,81 @@ export async function GET(req) {
   let jwt;
   try { jwt = await getJwt(); }
   catch (e) { return json({ error: String((e && e.message) || e) }, 200); }
+
+
+  // ---- prune: reclaim slots from jobs that are no longer live -----------
+  //
+  // Storage by Zapier caps a secret at 500 values and only drops keys after
+  // two months of inactivity, so without this the store fills and every new
+  // ad dies — the Zap's Set Value step errors, and Zapier halts the run
+  // before it reaches Gmail, so the email is never sent. Silent failure.
+  //
+  // A key looks like "45270-1eh78d6": job id, dash, ad fingerprint. The job
+  // id is read back off the key and checked against Tracker. If the job is
+  // finished (Placed, Lost, Withdrawn, On Hold) or no longer advertised, it
+  // will never need another ad, so its key is dead weight and goes.
+  //
+  //   ?mode=prune&offset=0&limit=30                 what WOULD be deleted
+  //   ?mode=prune&offset=0&limit=30&confirm=yes     delete it
+  //
+  // Bounded by limit because each key costs one Tracker lookup. Follow
+  // nextOffset until it comes back null.
+  if (mode === "prune") {
+    const offset = parseInt(url.searchParams.get("offset") || "0", 10) || 0;
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "", 10) || 30, 40);
+    const doDelete = url.searchParams.get("confirm") === "yes";
+
+    let store;
+    try { store = await storeGet(); }
+    catch (e) { return json({ error: String((e && e.message) || e) }); }
+
+    const allKeys = Object.keys(store);
+
+    // Anything not shaped like a job key is leftover scaffolding (the
+    // transport probes from the diagnostic) and is always safe to remove.
+    const junk = allKeys.filter((k) => !/^\d+-[0-9a-z]+$/.test(k));
+    const jobKeys = allKeys.filter((k) => /^\d+-[0-9a-z]+$/.test(k));
+    const slice = jobKeys.slice(offset, offset + limit);
+
+    const checked = await Promise.all(slice.map(async (key) => {
+      const id = key.split("-")[0];
+      const opp = await getOpportunity(jwt, id);
+      if (!opp) return { key, id, verdict: "keep", why: "could not read job — keeping to be safe" };
+      const f = mapOpportunity(opp);
+      if (f.dead) return { key, id, verdict: "delete", why: "status " + f.status, title: f.title };
+      if (!f.advertised) return { key, id, verdict: "delete", why: "advert no longer active", title: f.title };
+      return { key, id, verdict: "keep", why: f.status, title: f.title };
+    }));
+
+    const toDelete = checked.filter((c) => c.verdict === "delete").map((c) => c.key);
+    const targets = offset === 0 ? junk.concat(toDelete) : toDelete;
+
+    let deleted = 0;
+    const failures = [];
+    if (doDelete) {
+      for (const key of targets) {
+        const r = await storeDelete(key);
+        if (r.ok) deleted += 1; else failures.push({ key, status: r.status });
+      }
+    }
+
+    const nextOffset = offset + limit < jobKeys.length ? offset + limit : null;
+
+    return json({
+      mode: "prune",
+      dryRun: !doDelete,
+      storedBefore: allKeys.length,
+      jobKeys: jobKeys.length,
+      junkKeys: junk.length,
+      sliceRange: offset + "-" + Math.min(offset + limit, jobKeys.length),
+      wouldDelete: targets.length,
+      deleted,
+      failures,
+      estimatedStoredAfter: allKeys.length - deleted,
+      nextOffset,
+      detail: checked.filter((c) => c.verdict === "delete").slice(0, 20),
+    });
+  }
 
   // ---- ids: walk a bounded number of search pages ----------------------
   if (mode === "ids") {
