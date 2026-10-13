@@ -1,5 +1,6 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { isExcludedDepartment, isTestRecord, resolveDivision, dedupeKeyFor } from "../../../lib/config";
+import { markSeen, stored, ping, kvConfigured, TTL_DAYS } from "../../../lib/kv";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -223,6 +224,47 @@ export async function GET(req) {
   try { jwt = await getJwt(); }
   catch (e) { return json({ error: String((e && e.message) || e) }, 200); }
 
+
+  // ---- kv: is the new memory reachable, and how much is in it? ----------
+  if (mode === "kv") {
+    if (!kvConfigured()) {
+      return json({ error: "UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set in Vercel" });
+    }
+    try {
+      return json({ mode: "kv", ping: await ping(), stored: await stored(), ttlDays: TTL_DAYS, limit: "none" });
+    } catch (e) {
+      return json({ error: String((e && e.message) || e) });
+    }
+  }
+
+  // ---- kvseed: mark adverts already out as sent, in the new memory ------
+  // Same job as the old seeding: stop everything currently advertised from
+  // looking brand new. Takes the same &ids= batches.
+  if (mode === "kvseed") {
+    if (url.searchParams.get("confirm") !== "yes") return json({ error: "kvseed requires &confirm=yes" }, 400);
+
+    const ids = (url.searchParams.get("ids") || "")
+      .split(",").map((s) => s.trim()).filter(Boolean).slice(0, MAX_IDS_PER_CALL);
+    if (!ids.length) return json({ error: "pass &ids=1,2,3" }, 400);
+
+    const details = await Promise.all(ids.map((id) => getOpportunity(jwt, id)));
+    const rows = [];
+    const skipped = [];
+
+    for (const opp of details) {
+      if (!opp) continue;
+      const f = mapOpportunity(opp);
+      if (!f.advertised || f.dead || !f.title) { skipped.push({ id: f.id, why: f.dead ? ("status " + f.status) : "not a live advert" }); continue; }
+      if (isExcludedDepartment(f.department)) { skipped.push({ id: f.id, why: "excluded department" }); continue; }
+      if (isTestRecord(f.title, f.client)) { skipped.push({ id: f.id, why: "test record" }); continue; }
+
+      const key = dedupeKeyFor(f, resolveDivision(f.department, f.consultant));
+      await markSeen(key);
+      rows.push({ id: f.id, key, title: f.title });
+    }
+
+    return json({ mode: "kvseed", asked: ids.length, marked: rows.length, skipped: skipped.length, stored: await stored(), rows });
+  }
 
   // ---- deldiag: which delete call actually removes a key? ---------------
   //

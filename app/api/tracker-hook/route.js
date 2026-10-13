@@ -1,6 +1,7 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor, dedupeKeyFor } from "../../../lib/config";
 import { getOpportunity } from "../../../lib/tracker";
+import { claim, release, kvConfigured } from "../../../lib/kv";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -189,6 +190,26 @@ async function handle(req, body) {
   const payload = buildPayload(f, url.origin, token, force);
   if (dryRun) return ok({ ok: true, dryRun: true, wouldSend: payload });
 
+  // --- Has this exact advert already gone out? ---
+  // Decided here rather than in Zapier. Zapier's storage capped at 500
+  // entries and, once full, accepted writes and discarded them, so every
+  // ping looked like a new advert and consultants were emailed on every
+  // Tracker edit. claim() is atomic: it returns true only if this key was
+  // not already present, and reserves it in the same step.
+  if (!force && kvConfigured()) {
+    let fresh;
+    try {
+      fresh = await claim(payload.dedupeKey);
+    } catch (e) {
+      // Never let a memory failure silence an advert. Better a duplicate
+      // than a job that never reaches its consultant.
+      return ok({ ok: true, id: recordId, title: f.title, sent: false, error: "memory unavailable: " + String((e && e.message) || e) });
+    }
+    if (!fresh) {
+      return ok({ ok: true, id: recordId, title: f.title, skipped: ["already sent — nothing on the advert has changed"] });
+    }
+  }
+
   let forwarded = { ok: false };
   try {
     const r = await fetch(ZAPIER_HOOK, {
@@ -201,7 +222,13 @@ async function handle(req, body) {
     forwarded = { ok: false, error: String((e && e.message) || e) };
   }
 
-  return ok({ ok: true, id: recordId, title: f.title, sent: true, forwarded });
+  // Hand the reservation back if the send failed, so the next ping retries
+  // instead of the job being marked done and going quiet for good.
+  if (!forwarded.ok && !force && kvConfigured()) {
+    try { await release(payload.dedupeKey); } catch { /* nothing useful to do */ }
+  }
+
+  return ok({ ok: true, id: recordId, title: f.title, sent: forwarded.ok, forwarded });
 }
 
 export async function POST(req) {
