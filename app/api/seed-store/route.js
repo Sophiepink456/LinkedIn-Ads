@@ -225,6 +225,44 @@ export async function GET(req) {
   catch (e) { return json({ error: String((e && e.message) || e) }, 200); }
 
 
+  // ---- kvdiag: raw Upstash replies, no interpretation -------------------
+  // kvseed reported marking keys while DBSIZE stayed at 1. Rather than guess
+  // which end is lying, issue SET / GET / TTL / DBSIZE by hand and return
+  // exactly what comes back.
+  if (mode === "kvdiag") {
+    const base = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
+    const tok = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+    if (!base || !tok) return json({ error: "env vars missing", haveUrl: !!base, haveToken: !!tok });
+
+    const key = "kvdiag-" + Date.now().toString(36).slice(-5);
+    const run = async (label, body) => {
+      try {
+        const r = await fetch(base, {
+          method: "POST",
+          headers: { Authorization: "Bearer " + tok, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const text = await r.text();
+        return { label, sent: body, status: r.status, ok: r.ok, raw: text.slice(0, 300) };
+      } catch (e) {
+        return { label, sent: body, error: String((e && e.message) || e) };
+      }
+    };
+
+    const steps = [];
+    steps.push(await run("dbsize before", ["DBSIZE"]));
+    steps.push(await run("set with EX", ["SET", key, "1", "EX", "7776000"]));
+    steps.push(await run("get it back", ["GET", key]));
+    steps.push(await run("ttl", ["TTL", key]));
+    steps.push(await run("dbsize after", ["DBSIZE"]));
+    steps.push(await run("set plain", ["SET", key + "-plain", "1"]));
+    steps.push(await run("get plain", ["GET", key + "-plain"]));
+    steps.push(await run("dbsize final", ["DBSIZE"]));
+    steps.push(await run("scan", ["SCAN", "0", "COUNT", "10"]));
+
+    return json({ mode: "kvdiag", urlHost: base.replace(/^https?:\/\//, "").split("/")[0], steps });
+  }
+
   // ---- kv: is the new memory reachable, and how much is in it? ----------
   if (mode === "kv") {
     if (!kvConfigured()) {
