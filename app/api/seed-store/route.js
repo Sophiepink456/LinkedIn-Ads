@@ -236,6 +236,12 @@ export async function GET(req) {
     const stamp = Date.now().toString(36).slice(-4);
     const out = [];
 
+    // A full store silently discards writes, so a freshly written probe key
+    // cannot be used as the delete target. Pass &key= an EXISTING key instead
+    // (use one the prune already flagged as stale, so removing it is wanted
+    // either way) and &method= 0-3 to try one approach at a time.
+    const realKey = url.searchParams.get("key");
+
     const exists = async (key) => {
       const r = await fetch(STORE_URL + qs, { headers: { "X-Secret": secret } });
       let obj = {};
@@ -274,17 +280,23 @@ export async function GET(req) {
       },
     ];
 
+    const only = url.searchParams.get("method");
     for (let i = 0; i < attempts.length; i++) {
+      if (only != null && String(i) !== only) continue;
       const a = attempts[i];
-      const key = "deldiag-" + stamp + "-" + i;
+      const key = realKey || ("deldiag-" + stamp + "-" + i);
       let wrote = null, del = null, before = null, after = null;
       try {
-        const w = await fetch(STORE_URL + qs, {
-          method: "POST",
-          headers: { "X-Secret": secret, "Content-Type": "application/json" },
-          body: JSON.stringify({ [key]: "probe" }),
-        });
-        wrote = w.status;
+        if (!realKey) {
+          const w = await fetch(STORE_URL + qs, {
+            method: "POST",
+            headers: { "X-Secret": secret, "Content-Type": "application/json" },
+            body: JSON.stringify({ [key]: "probe" }),
+          });
+          wrote = w.status;
+        } else {
+          wrote = "existing key, not written";
+        }
         before = await exists(key);
         const d = await a.run(key);
         del = { status: d.status, body: (await d.text()).slice(0, 120) };
