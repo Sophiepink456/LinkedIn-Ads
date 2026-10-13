@@ -224,6 +224,80 @@ export async function GET(req) {
   catch (e) { return json({ error: String((e && e.message) || e) }, 200); }
 
 
+  // ---- deldiag: which delete call actually removes a key? ---------------
+  //
+  // DELETE returned ok for 87 keys and removed none of them. The same thing
+  // happened with writes: Zapier answers 2xx on a request it then ignores.
+  // So rather than guess again, write a probe four ways, try to delete it
+  // four ways, and read back each time to see which one really worked.
+  if (mode === "deldiag") {
+    const secret = storeSecret();
+    const qs = "?secret=" + encodeURIComponent(secret);
+    const stamp = Date.now().toString(36).slice(-4);
+    const out = [];
+
+    const exists = async (key) => {
+      const r = await fetch(STORE_URL + qs, { headers: { "X-Secret": secret } });
+      let obj = {};
+      try { obj = JSON.parse(await r.text()); } catch { /* empty */ }
+      return Object.prototype.hasOwnProperty.call(obj, key);
+    };
+
+    const attempts = [
+      {
+        name: "DELETE ?secret&key",
+        run: (k) => fetch(STORE_URL + qs + "&key=" + encodeURIComponent(k), {
+          method: "DELETE", headers: { "X-Secret": secret },
+        }),
+      },
+      {
+        name: "DELETE ?key + header only",
+        run: (k) => fetch(STORE_URL + "?key=" + encodeURIComponent(k), {
+          method: "DELETE", headers: { "X-Secret": secret },
+        }),
+      },
+      {
+        name: "POST value null",
+        run: (k) => fetch(STORE_URL + qs, {
+          method: "POST",
+          headers: { "X-Secret": secret, "Content-Type": "application/json" },
+          body: JSON.stringify({ [k]: null }),
+        }),
+      },
+      {
+        name: "DELETE body {key}",
+        run: (k) => fetch(STORE_URL + qs, {
+          method: "DELETE",
+          headers: { "X-Secret": secret, "Content-Type": "application/json" },
+          body: JSON.stringify({ key: k }),
+        }),
+      },
+    ];
+
+    for (let i = 0; i < attempts.length; i++) {
+      const a = attempts[i];
+      const key = "deldiag-" + stamp + "-" + i;
+      let wrote = null, del = null, before = null, after = null;
+      try {
+        const w = await fetch(STORE_URL + qs, {
+          method: "POST",
+          headers: { "X-Secret": secret, "Content-Type": "application/json" },
+          body: JSON.stringify({ [key]: "probe" }),
+        });
+        wrote = w.status;
+        before = await exists(key);
+        const d = await a.run(key);
+        del = { status: d.status, body: (await d.text()).slice(0, 120) };
+        after = await exists(key);
+      } catch (e) {
+        del = { error: String((e && e.message) || e) };
+      }
+      out.push({ method: a.name, key, wrote, presentBeforeDelete: before, del, presentAfterDelete: after, worked: before === true && after === false });
+    }
+
+    return json({ mode: "deldiag", attempts: out });
+  }
+
   // ---- prune: reclaim slots from jobs that are no longer live -----------
   //
   // Storage by Zapier caps a secret at 500 values and only drops keys after
