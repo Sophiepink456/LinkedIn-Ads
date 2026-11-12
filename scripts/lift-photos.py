@@ -7,6 +7,13 @@ Each carries three things that have to come off: the thin "e" line-art that
 sweeps across the whole frame, the old branding top and bottom, and a dark
 overlay burnt into the picture.
 
+This is recovery, not retouching, and it has limits. The overlay destroyed the
+highlights rather than hiding them, so what comes out has a restored range but
+not the detail that was in the original frame, and a trace of the line-art can
+still be found in a flat area if you look for it. The real fix is the original
+photographs; two of them are embedded in the brand file and were used to
+calibrate the tone curve below.
+
 Run with: python3 scripts/lift-photos.py
 """
 import numpy as np, glob, os
@@ -15,8 +22,31 @@ from PIL import Image, ImageFilter
 SRC = os.path.join(os.path.dirname(__file__), "..", "public", "backgrounds")
 DST = os.path.join(os.path.dirname(__file__), "..", "public", "photos")
 TOP, BOT = 220, 867     # the band between the old pill and the old logo
-TARGET = 86.0           # brightness the brand frames sit at, un-overlaid
 BLUR = 18               # separates the thin line-art from the photography
+
+# ---- Putting the tones back ------------------------------------------------
+# The old adverts' burnt-in overlay did not just darken the picture, it
+# flattened it: exec-05 came off the old artwork with every pixel between 22
+# and 108, so no true black and no highlight at all. A photograph with no ends
+# to its range reads as though something grey is lying over it, which is what
+# it looked like even after the overlay was subtracted and the brightness
+# lifted — the first attempt matched the brand frames' average and left them
+# just as flat.
+#
+# The targets below are the quantiles of the ORIGINAL photographs, taken from
+# the two that are embedded in the brand file (nodes 303:239 and 303:266,
+# before Figma's 20% scrim). Their black and white points agree closely —
+# about 10 and 212 — while their midtones differ with the scene, so the
+# midtones here sit between the two and a little above, which keeps faces
+# readable in the back-lit shots.
+QUANTILES = [0.5, 1, 5, 25, 50, 75, 95, 99, 99.5]
+TARGET_TONES = [6.0, 10.0, 18.0, 46.0, 88.0, 135.0, 190.0, 214.0, 220.0]
+
+# Rec. 601 luma. The curve is applied to brightness alone and the three
+# channels are scaled together by the result: run channel by channel it
+# stretches the colour differences too, which turned a red cardigan scarlet
+# and a dark green wall cyan.
+LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 # ---- How far each picture can be shifted ----------------------------------
 # The old advert's "New Vacancy" pill sat at y 89-174 and its "i" icon at
@@ -117,14 +147,20 @@ def process(path, overlay, name):
     ref = np.percentile(smooth, 85)
     a *= np.clip((ref / np.maximum(smooth, 1.0)) ** 0.6, 1.0, 1.9)[:, None, None]
 
-    # 4. Lift to the target brightness.
-    gain = float(np.clip((TARGET / max(a.mean(), 1.0)) ** 0.75, 1.0, 2.3))
-    a *= gain
+    # 4. Put the tonal range back: map this picture's own quantiles onto the
+    #    originals'. A plain brightness gain cannot do this — the range has to
+    #    be opened out at both ends, not slid along.
+    return Image.fromarray(np.clip(retone(a), 0, 255).astype(np.uint8))
 
-    # 5. Roll the highlights off instead of clipping them flat, so faces and
-    #    windows keep their detail.
-    a = np.where(a > 200, 200 + (a - 200) * (55.0 / max(a.max() - 200, 55.0)), a)
-    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+
+def retone(a):
+    y = (a * LUMA).sum(axis=2)
+    src = np.percentile(y, QUANTILES)
+    xs = np.concatenate(([0.0], src, [max(src[-1] + 1.0, 255.0)]))
+    ys = np.concatenate(([0.0], TARGET_TONES, [255.0]))
+    keep = np.concatenate(([True], np.diff(xs) > 1e-3))   # the curve must rise
+    scale = np.interp(y, xs[keep], ys[keep]) / np.maximum(y, 1.0)
+    return a * np.clip(scale, 0.0, 6.0)[:, :, None]
 
 
 total = 0
