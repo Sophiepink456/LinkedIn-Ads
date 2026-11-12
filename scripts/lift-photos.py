@@ -32,7 +32,7 @@ CLEAN_TOP, CLEAN_BOT = 175, 985
 OFFSETS = {
     # move the picture down — more room above the head
     "bg-04": -45, "bg-05": -45, "bg-09": -140, "bg-10": -45,
-    "bg-15": -45, "bg-16": -45, "bg-28": -45,
+    "bg-15": -45, "bg-16": -45, "bg-28": -45, "exec-05": -95,
     # move the picture up
     "bg-11": 90, "bg-17": 90, "bg-19": 90, "bg-20": 90, "bg-22": 90,
     "bg-23": 90, "bg-29": 90, "bg-32": 90, "exec-02": 90, "exec-08": 90,
@@ -47,7 +47,7 @@ DROP = {"bg-25"}
 # corner is texture — foliage, a blurred wall — and never where it holds a face,
 # a straight edge or lettering: check the result before adding a name here.
 PILL_BOX = (80, 78, 384, 186)
-PILL_FILL = {"bg-09"}
+PILL_FILL = {"bg-09", "exec-05"}
 
 os.makedirs(DST, exist_ok=True)
 
