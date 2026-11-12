@@ -1,7 +1,7 @@
 import { ImageResponse } from "next/og";
 import { PHOTO_BASE_URL, PHOTO_SCRIM, backgroundsFor, resolveDivision, resolveType } from "../../../lib/config";
 import { formatSalary, parseRange } from "../../../lib/salary";
-import { buildAd, CANVAS_W, CANVAS_H } from "../../../lib/ad-layout";
+import { buildAd, CANVAS_W, CANVAS_H, FONT_DISPLAY, FONT_META, FONT_SMALL, FONT_WEIGHT } from "../../../lib/ad-layout";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -99,9 +99,13 @@ export async function GET(req) {
 
   const photo = pickBackground(origin, searchParams.get("image"), division, seq);
 
-  const [bold, semiBold] = await Promise.all([
-    fetch(new URL("../../fonts/GoogleSansFlex-700.ttf", import.meta.url)).then((r) => r.arrayBuffer()),
-    fetch(new URL("../../fonts/GoogleSansFlex-600.ttf", import.meta.url)).then((r) => r.arrayBuffer()),
+  // Three cuts of Google Sans Flex Medium, one per optical size used. See the
+  // note in lib/ad-layout.js: the font's optical-size axis is what keeps the
+  // title matching the brand file.
+  const [display, metaFont, small] = await Promise.all([
+    fetch(new URL("../../fonts/GSF-display.ttf", import.meta.url)).then((r) => r.arrayBuffer()),
+    fetch(new URL("../../fonts/GSF-meta.ttf", import.meta.url)).then((r) => r.arrayBuffer()),
+    fetch(new URL("../../fonts/GSF-small.ttf", import.meta.url)).then((r) => r.arrayBuffer()),
   ]);
 
   return new ImageResponse(
@@ -122,8 +126,9 @@ export async function GET(req) {
       width: CANVAS_W,
       height: CANVAS_H,
       fonts: [
-        { name: "Google Sans Flex", data: bold, weight: 700, style: "normal" },
-        { name: "Google Sans Flex", data: semiBold, weight: 600, style: "normal" },
+        { name: FONT_DISPLAY, data: display, weight: FONT_WEIGHT, style: "normal" },
+        { name: FONT_META, data: metaFont, weight: FONT_WEIGHT, style: "normal" },
+        { name: FONT_SMALL, data: small, weight: FONT_WEIGHT, style: "normal" },
       ],
       headers: {
         "Content-Type": "image/png",
