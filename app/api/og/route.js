@@ -1,5 +1,5 @@
 import { ImageResponse } from "next/og";
-import { PHOTO_BASE_URL, PHOTOS_HAVE_BAKED_OVERLAY, PHOTO_FOCUS, backgroundsFor, resolveDivision, resolveType } from "../../../lib/config";
+import { PHOTO_BASE_URL, PHOTO_SCRIM, backgroundsFor, resolveDivision, resolveType } from "../../../lib/config";
 import { formatSalary, parseRange } from "../../../lib/salary";
 import { buildAd, CANVAS_W, CANVAS_H } from "../../../lib/ad-layout";
 
@@ -113,10 +113,10 @@ export async function GET(req) {
       division,
       title,
       meta,
-      focus: searchParams.get("focus") || PHOTO_FOCUS,
+      focus: searchParams.get("focus") || "center",
       scrim: searchParams.get("scrim") === "1" ? true
         : searchParams.get("scrim") === "0" ? false
-        : !PHOTOS_HAVE_BAKED_OVERLAY,
+        : PHOTO_SCRIM,
     }),
     {
       width: CANVAS_W,
