@@ -1,7 +1,7 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor, dedupeKeyFor } from "../../../lib/config";
 import { getOpportunity } from "../../../lib/tracker";
-import { claim, release, kvConfigured } from "../../../lib/kv";
+import { claim, release, kvConfigured, nextSequence } from "../../../lib/kv";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -77,7 +77,7 @@ function publishedOnOrAfter(publishDate, floor) {
   return String(publishDate || "").slice(0, 10) >= floor;
 }
 
-function buildPayload(f, origin, token, force) {
+function buildPayload(f, origin, token, force, seq) {
   const division = resolveDivision(f.department, f.consultant);
 
   const base = new URLSearchParams();
@@ -87,6 +87,8 @@ function buildPayload(f, origin, token, force) {
   if (f.location) base.set("location", f.location);
   if (f.employmentType) base.set("employment_type", f.employmentType);
   base.set("image", "auto");
+  // Decides which of the three panel styles and which photo this advert gets.
+  if (seq != null) base.set("seq", String(seq));
   if (token) base.set("token", token);
 
   const withSalary = new URLSearchParams(base);
@@ -187,7 +189,15 @@ async function handle(req, body) {
     return ok({ ok: true, id: recordId, title: f.title, skipped: reasons });
   }
 
-  const payload = buildPayload(f, url.origin, token, force);
+  // One counter shared by every advert, so the styles rotate 1, 2, 3 rather
+  // than each advert picking at random and repeating. A failure here must not
+  // stop the advert — it only costs the rotation.
+  let seq = null;
+  if (kvConfigured()) {
+    try { seq = await nextSequence(); } catch { seq = null; }
+  }
+
+  const payload = buildPayload(f, url.origin, token, force, seq);
   if (dryRun) return ok({ ok: true, dryRun: true, wouldSend: payload });
 
   // --- Has this exact advert already gone out? ---

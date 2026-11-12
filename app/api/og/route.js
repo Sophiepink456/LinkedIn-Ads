@@ -1,22 +1,17 @@
 import { ImageResponse } from "next/og";
-import { GREEN, PHOTO_BASE_URL, backgroundsFor, resolveDivision, resolveType } from "../../../lib/config";
+import { PHOTO_BASE_URL, backgroundsFor, resolveDivision, resolveType } from "../../../lib/config";
 import { formatSalary, parseRange } from "../../../lib/salary";
+import { buildAd, CANVAS_W, CANVAS_H } from "../../../lib/ad-layout";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
-// ---- Layout ---------------------------------------------------------------
-const TEXT_LEFT = 100;
-const TITLE_SIZE = 92;
-const TITLE_BLOCK_BOTTOM = 396;
-const SECTOR_SIZE = 34;
-const SECTOR_GAP = 23;
-const RIGHT_MARGIN = 90;
-const LOCATION_LEFT = 164;
-const LOCATION_CENTER_Y = 1026;
-const LOCATION_BOX_H = 60;
-const LOCATION_SIZE = 38;
-// ---------------------------------------------------------------------------
+// The three panel treatments from the brand file, exported from Figma. Which
+// one an advert gets is decided by ?seq, which the webhook increments, so
+// consecutive adverts cycle 1, 2, 3 rather than repeating at random.
+const TEXTURES = ["/frames/texture-1.png", "/frames/texture-2.png", "/frames/texture-3.png"];
+const LOGO = "/frames/logo.png";
+const LINK_ICON = "/frames/link-icon.png";
 
 function resolveImage(origin, file) {
   if (file.startsWith("http")) return file;
@@ -24,14 +19,25 @@ function resolveImage(origin, file) {
   return base + file;
 }
 
-// Picks a background at random from the pool for this division. Leadership &
-// Executive has its own set; everything else uses the general one. An explicit
-// ?image=filename still overrides both, which is what the manual form uses.
-function pickBackground(origin, param, division) {
+// A number that advances by one per advert sent. Falls back to a hash of the
+// advert's own wording when it is missing — the preview links and the manual
+// generator have no counter, and two different jobs should still not look
+// identical side by side.
+function sequenceFor(param, seed) {
+  const n = parseInt(param || "", 10);
+  if (Number.isFinite(n) && n >= 0) return n;
+  let hsh = 0;
+  const s = String(seed || "");
+  for (let i = 0; i < s.length; i++) hsh = (hsh * 31 + s.charCodeAt(i)) >>> 0;
+  return hsh;
+}
+
+// Backgrounds step through the pool in order rather than being drawn at random,
+// so a run of adverts does not repeat the same photograph.
+function pickBackground(origin, param, division, seq) {
   if (param && param !== "auto") return resolveImage(origin, param);
   const pool = backgroundsFor(division);
-  const f = pool[Math.floor(Math.random() * pool.length)];
-  return resolveImage(origin, f);
+  return resolveImage(origin, pool[seq % pool.length]);
 }
 
 // The URL ends "/api/og?..." with no extension, so anything downloading it has
@@ -56,7 +62,7 @@ export async function GET(req) {
 
   const rawDivision = searchParams.get("division") || searchParams.get("sector") || "";
   const consultant = searchParams.get("consultant") || "";
-  const sector = resolveDivision(rawDivision, consultant).toUpperCase();
+  const division = resolveDivision(rawDivision, consultant).toUpperCase();
   const title = (searchParams.get("title") || "Job Title").trim();
   const location = (searchParams.get("location") || "").trim();
 
@@ -77,53 +83,40 @@ export async function GET(req) {
     hide: searchParams.get("hide_salary"),
   });
 
+  // resolveType returns null for Permanent and Full-time, so an ordinary
+  // permanent role simply reads "£90,000 - £95,000 | Sheffield".
   const typeLabel = resolveType(
     searchParams.get("employment_type"),
     searchParams.get("working_pattern")
   );
-  // `sector` is the resolved division, so the exec pool is picked up whether it
-  // came from the department or from a consultant override.
-  const bg = pickBackground(origin, searchParams.get("image"), sector);
-  const locSalary = [location, salary, typeLabel].filter(Boolean).join(" | ");
+  const meta = [salary, typeLabel, location].filter(Boolean).join(" | ");
+
+  const seq = sequenceFor(searchParams.get("seq"), title + "|" + location + "|" + division);
+  const styleParam = parseInt(searchParams.get("style") || "", 10);
+  const styleIndex = Number.isFinite(styleParam) && styleParam >= 1 && styleParam <= 3
+    ? styleParam - 1
+    : seq % TEXTURES.length;
+
+  const photo = pickBackground(origin, searchParams.get("image"), division, seq);
 
   const [bold, semiBold] = await Promise.all([
     fetch(new URL("../../fonts/Area-Bold.otf", import.meta.url)).then((r) => r.arrayBuffer()),
     fetch(new URL("../../fonts/Area-SemiBold.otf", import.meta.url)).then((r) => r.arrayBuffer()),
   ]);
 
-  const words = title.split(" ");
-  const lastWord = words.pop();
-
-  const filename = buildFilename(title, !!salaryText);
-
   return new ImageResponse(
-    (
-      <div style={{ position: "relative", width: "1080px", height: "1350px", display: "flex", fontFamily: "Area" }}>
-        <img src={bg} width={1080} height={1350}
-          style={{ position: "absolute", top: 0, left: 0, width: "1080px", height: "1350px", objectFit: "cover" }} />
-
-        <div style={{ position: "absolute", left: TEXT_LEFT, bottom: TITLE_BLOCK_BOTTOM,
-          width: 1080 - TEXT_LEFT - RIGHT_MARGIN, display: "flex", flexDirection: "column" }}>
-          {sector ? (
-            <div style={{ display: "flex", color: GREEN, fontSize: SECTOR_SIZE, fontWeight: 600,
-              letterSpacing: "2px", marginBottom: SECTOR_GAP }}>{sector}</div>
-          ) : null}
-          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", color: "#ffffff",
-            fontSize: TITLE_SIZE, fontWeight: 700, lineHeight: 1.2, letterSpacing: "-1px" }}>
-            {words.map((w, i) => (<span key={i} style={{ marginRight: "0.28em" }}>{w}</span>))}
-            <span style={{ display: "flex" }}>{lastWord}<span style={{ color: GREEN }}>.</span></span>
-          </div>
-        </div>
-
-        <div style={{ position: "absolute", left: LOCATION_LEFT, top: LOCATION_CENTER_Y - LOCATION_BOX_H / 2,
-          height: LOCATION_BOX_H, display: "flex", alignItems: "center" }}>
-          <div style={{ display: "flex", color: "#ffffff", fontSize: LOCATION_SIZE, fontWeight: 600 }}>{locSalary}</div>
-        </div>
-      </div>
-    ),
+    buildAd({
+      photo,
+      texture: origin + TEXTURES[styleIndex],
+      logo: origin + LOGO,
+      linkIcon: origin + LINK_ICON,
+      division,
+      title,
+      meta,
+    }),
     {
-      width: 1080,
-      height: 1350,
+      width: CANVAS_W,
+      height: CANVAS_H,
       fonts: [
         { name: "Area", data: bold, weight: 700, style: "normal" },
         { name: "Area", data: semiBold, weight: 600, style: "normal" },
@@ -132,7 +125,7 @@ export async function GET(req) {
         "Content-Type": "image/png",
         // "inline" keeps it viewable in a browser tab while still supplying the
         // name that download tools and Zapier use for the attachment.
-        "Content-Disposition": 'inline; filename="' + filename + '"',
+        "Content-Disposition": 'inline; filename="' + buildFilename(title, !!salaryText) + '"',
       },
     }
   );
