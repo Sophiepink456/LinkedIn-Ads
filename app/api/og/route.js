@@ -100,8 +100,8 @@ export async function GET(req) {
   const photo = pickBackground(origin, searchParams.get("image"), division, seq);
 
   const [bold, semiBold] = await Promise.all([
-    fetch(new URL("../../fonts/Area-Bold.otf", import.meta.url)).then((r) => r.arrayBuffer()),
-    fetch(new URL("../../fonts/Area-SemiBold.otf", import.meta.url)).then((r) => r.arrayBuffer()),
+    fetch(new URL("../../fonts/GoogleSansFlex-700.ttf", import.meta.url)).then((r) => r.arrayBuffer()),
+    fetch(new URL("../../fonts/GoogleSansFlex-600.ttf", import.meta.url)).then((r) => r.arrayBuffer()),
   ]);
 
   return new ImageResponse(
@@ -122,8 +122,8 @@ export async function GET(req) {
       width: CANVAS_W,
       height: CANVAS_H,
       fonts: [
-        { name: "Area", data: bold, weight: 700, style: "normal" },
-        { name: "Area", data: semiBold, weight: 600, style: "normal" },
+        { name: "Google Sans Flex", data: bold, weight: 700, style: "normal" },
+        { name: "Google Sans Flex", data: semiBold, weight: 600, style: "normal" },
       ],
       headers: {
         "Content-Type": "image/png",
