@@ -1,5 +1,7 @@
 import { mapOpportunity } from "../../../lib/mapping";
-import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision } from "../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision,
+  recipientsFor, dedupeKeyFor } from "../../../lib/config";
+import { seen, kvConfigured } from "../../../lib/kv";
 import { getOpportunity, pagedSearch } from "../../../lib/tracker";
 
 export const runtime = "edge";
@@ -17,9 +19,21 @@ export const dynamic = "force-dynamic";
 // missed is still visible. It does NOT talk to the ads Zap and cannot cause a
 // duplicate — it is a report, not a sender.
 //
+// Each job carries a verdict, so "why did this one not arrive?" is answerable
+// without guessing. It applies the SAME checks as the webhook and, crucially,
+// asks the de-duplication store whether the advert has already been recorded
+// as sent: that is the one failure mode with no trace anywhere else. If a key
+// was claimed and then the email never went out, the job looks perfectly
+// healthy from every other angle and will never be sent again on its own.
+//
+// ?verdict=blocked  lists only the jobs that would NOT produce an advert.
+//
 // Intended use: a Schedule by Zapier trigger each morning -> Webhooks GET this
 // URL -> Gmail the summary to Sophie.
 // ---------------------------------------------------------------------------
+
+// Must match the webhook's own floor, which is where it is defined.
+const ADVERTS_PUBLISHED_FROM = process.env.ADVERTS_PUBLISHED_FROM || "2026-09-01";
 
 const LOOKBACK_DAYS = 2;      // adverts published within this window
 const TRAWL_DAYS = 7;         // how far back to search for candidates
@@ -88,14 +102,37 @@ export async function GET(req) {
 
   const origin = url.origin;
 
-  const jobs = details
+  // Why would this job NOT produce an advert? Mirrors the webhook's checks.
+  const blockers = (f) => {
+    const out = [];
+    if (!f.advertised) out.push("advertStatus is not A — not advertised");
+    if (f.dead) out.push("status is " + (f.status || "(none)") + " — not advertising");
+    if (!f.title) out.push("no advert title");
+    if (isExcludedDepartment(f.department)) out.push("excluded department: " + f.department);
+    if (isTestRecord(f.title, f.client)) out.push("test or training record");
+    if (String(f.publishDate || "").slice(0, 10) < ADVERTS_PUBLISHED_FROM) {
+      out.push("published before the " + ADVERTS_PUBLISHED_FROM + " cut-off");
+    }
+    return out;
+  };
+
+  const mapped = details
     .map((opp) => mapOpportunity(opp))
-    .filter((f) => f.advertised && !f.filled && !f.closed && f.title)
-    .filter((f) => !isExcludedDepartment(f.department))
-    .filter((f) => !isTestRecord(f.title, f.client))
-    .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)))
-    .map((f) => {
+    .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)));
+
+  const jobs = await Promise.all(mapped
+    .map(async (f) => {
       const division = resolveDivision(f.department, f.consultant);
+      const skipped = blockers(f);
+
+      // Already recorded as sent? The ONLY way an otherwise healthy advert
+      // silently never arrives. Never written to here, only read.
+      let alreadySent = null;
+      if (!skipped.length && kvConfigured()) {
+        try { alreadySent = await seen(dedupeKeyFor(f, division)); } catch { alreadySent = null; }
+      }
+
+      const recipients = recipientsFor({ ...f, division });
 
       const base = new URLSearchParams();
       if (f.department) base.set("division", f.department);
@@ -121,30 +158,62 @@ export async function GET(req) {
         division,
         location: f.location,
         client: f.client,
+        status: f.status,
+        department: f.department,
         publishDate: String(f.publishDate).slice(0, 10),
+        verdict: skipped.length ? "blocked"
+          : alreadySent === true ? "already recorded as sent"
+          : "would send",
+        skipped,
+        alreadySent,
+        emailTo: recipients.to.join(", "),
+        emailCc: recipients.cc.join(", "),
+        noAddressOnFile: recipients.missing.join(", "),
+        resend: origin + "/api/tracker-hook?id=" + f.id + "&force=1" + (token ? "&token=" + token : ""),
         imageUrl: origin + "/api/og?" + withSalary.toString(),
         imageUrlCompetitive: origin + "/api/og?" + competitive.toString(),
       };
-    });
+    }));
+
+  const only = url.searchParams.get("verdict");
+  const shown = only === "blocked"
+    ? jobs.filter((j) => j.verdict !== "would send")
+    : jobs;
 
   // A ready-made email body, so the Zap can just drop it into Gmail.
-  const lines = jobs.map((j) =>
-    j.publishDate + "  —  " + j.title + "  —  " + j.consultant + " (" + (j.division || "no division") + ")\n" +
-    "    With salary:  " + j.imageUrl + "\n" +
-    "    Competitive:  " + j.imageUrlCompetitive
-  );
+  const lines = shown.map((j) => {
+    const head = j.publishDate + "  —  " + j.title + "  —  " + j.consultant +
+      " (" + (j.division || "no division") + ")  [" + j.verdict + "]";
+    if (j.verdict === "blocked") return head + "\n    " + j.skipped.join("\n    ");
+    const bits = [head, "    To: " + (j.emailTo || "(nobody)")];
+    if (j.noAddressOnFile) bits.push("    NO ADDRESS ON FILE: " + j.noAddressOnFile);
+    if (j.alreadySent) bits.push("    Already recorded as sent. If it never arrived, re-send: " + j.resend);
+    bits.push("    With salary:  " + j.imageUrl);
+    bits.push("    Competitive:  " + j.imageUrlCompetitive);
+    return bits.join("\n");
+  });
+
+  const counts = {
+    wouldSend: jobs.filter((j) => j.verdict === "would send").length,
+    alreadySent: jobs.filter((j) => j.verdict === "already recorded as sent").length,
+    blocked: jobs.filter((j) => j.verdict === "blocked").length,
+    noAddressOnFile: jobs.filter((j) => j.noAddressOnFile).length,
+  };
 
   const summary =
-    jobs.length === 0
-      ? "No adverts published in the last " + days + " days."
-      : jobs.length + " advert(s) published in the last " + days + " days:\n\n" + lines.join("\n\n") +
-        "\n\nIf any of these did not arrive as an ad, the links above will render them.";
+    shown.length === 0
+      ? "Nothing to report in the last " + days + " days."
+      : shown.length + " advert(s) published in the last " + days + " days  (" +
+        counts.wouldSend + " would send, " + counts.alreadySent + " already recorded as sent, " +
+        counts.blocked + " blocked):\n\n" + lines.join("\n\n");
 
   return new Response(JSON.stringify({
     generatedAt: new Date().toISOString(),
     publishedOnOrAfter: cutoff,
-    count: jobs.length,
+    memory: kvConfigured() ? "connected" : "NOT CONFIGURED — nothing is being de-duplicated",
+    counts,
+    count: shown.length,
     summary,
-    jobs,
+    jobs: shown,
   }, null, 2), { headers: { "content-type": "application/json" } });
 }
