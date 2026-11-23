@@ -1,7 +1,7 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor, dedupeKeyFor } from "../../../lib/config";
 import { getOpportunity } from "../../../lib/tracker";
-import { claim, release, kvConfigured, nextSequence } from "../../../lib/kv";
+import { claim, release, seen, kvConfigured, nextSequence } from "../../../lib/kv";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -198,7 +198,34 @@ async function handle(req, body) {
   }
 
   const payload = buildPayload(f, url.origin, token, force, seq);
-  if (dryRun) return ok({ ok: true, dryRun: true, wouldSend: payload });
+
+  if (dryRun) {
+    // The dry run used to stop here, which made it answer "why did this job
+    // not produce an advert?" while skipping the likeliest reason: the advert
+    // was recorded as sent and the email then never arrived. That leaves no
+    // trace anywhere else, and the job looks perfectly healthy.
+    //
+    // Read-only — seen() never claims a key, so a dry run still cannot stop a
+    // real advert later. ?force=1 makes the key deliberately unique, so the
+    // check uses the plain key the webhook would actually have claimed.
+    let alreadySent = null;
+    if (kvConfigured()) {
+      const division = resolveDivision(f.department, f.consultant);
+      try { alreadySent = await seen(dedupeKeyFor(f, division)); } catch { alreadySent = null; }
+    }
+    return ok({
+      ok: true,
+      dryRun: true,
+      alreadySent,
+      verdict: alreadySent === true
+        ? "already recorded as sent — the webhook would skip this. If the email never arrived, re-send with the link below."
+        : alreadySent === false
+          ? "not in the memory — the webhook would send this advert"
+          : "memory not checked (not configured, or unreachable)",
+      resend: url.origin + "/api/tracker-hook?id=" + recordId + "&force=1" + (token ? "&token=" + token : ""),
+      wouldSend: payload,
+    });
+  }
 
   // --- Has this exact advert already gone out? ---
   // Decided here rather than in Zapier. Zapier's storage capped at 500
