@@ -2,7 +2,7 @@ import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision,
   recipientsFor, dedupeKeyFor } from "../../../lib/config";
 import { seen, kvConfigured } from "../../../lib/kv";
-import { getOpportunity, pagedSearch } from "../../../lib/tracker";
+import { getOpportunityResult, pagedSearch } from "../../../lib/tracker";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -39,7 +39,11 @@ const LOOKBACK_DAYS = 2;      // adverts published within this window
 const TRAWL_DAYS = 7;         // how far back to search for candidates
 const MAX_PAGES = 40;
 const MAX_DETAILS = 120;
-const CONCURRENCY = 10;
+// Tracker invalidates the previous token every time a new one is issued, so
+// look-ups running side by side can reject each other. lib/tracker.js now
+// stops a rejected call from forcing a needless re-exchange, but a smaller
+// batch keeps the blast radius down.
+const CONCURRENCY = 4;
 
 function daysAgoISO(days) {
   return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
@@ -66,12 +70,19 @@ async function fetchAllPages(baseBody) {
 
 async function fetchDetails(ids) {
   const out = [];
+  const failed = [];
   for (let i = 0; i < ids.length; i += CONCURRENCY) {
     const batch = ids.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(batch.map((id) => getOpportunity(id)));
-    out.push(...results.filter(Boolean));
+    const results = await Promise.all(batch.map((id) => getOpportunityResult(id)));
+    results.forEach((r, n) => {
+      // Previously these were dropped with .filter(Boolean), so a job Tracker
+      // would not return simply vanished from the report — the safety net
+      // quietly had holes in it.
+      if (r.ok && r.data) out.push(r.data);
+      else failed.push({ id: batch[n], reason: r.reason || "no record returned" });
+    });
   }
-  return out;
+  return { records: out, failed };
 }
 
 export async function GET(req) {
@@ -98,7 +109,7 @@ export async function GET(req) {
     .sort((a, b) => String(b.publishDate || "").localeCompare(String(a.publishDate || "")));
 
   const ids = recent.map((o) => o.opportunityId || o.id).filter(Boolean).slice(0, MAX_DETAILS);
-  const details = await fetchDetails(ids);
+  const { records: details, failed } = await fetchDetails(ids);
 
   const origin = url.origin;
 
@@ -210,6 +221,7 @@ export async function GET(req) {
   return new Response(JSON.stringify({
     generatedAt: new Date().toISOString(),
     publishedOnOrAfter: cutoff,
+    couldNotRead: failed,
     memory: kvConfigured() ? "connected" : "NOT CONFIGURED — nothing is being de-duplicated",
     counts,
     count: shown.length,

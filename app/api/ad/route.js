@@ -1,7 +1,7 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision,
   recipientsFor, dedupeKeyFor } from "../../../lib/config";
-import { getOpportunity } from "../../../lib/tracker";
+import { getOpportunityResult } from "../../../lib/tracker";
 import { seen, kvConfigured } from "../../../lib/kv";
 
 export const runtime = "edge";
@@ -134,10 +134,15 @@ export async function GET(req) {
 
   const hideSalary = url.searchParams.get("hide_salary") === "1";
 
-  const cards = await Promise.all(ids.map(async (id, i) => {
+  const cards = [];
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    cards.push(await (async () => {
     try {
-      const opp = await getOpportunity(id);
-      if (!opp) return { id, error: "not found in Tracker" };
+      const r = await getOpportunityResult(id);
+      if (!r.ok) return { id, error: r.reason };
+      const opp = r.data;
+      if (!opp) return { id, error: "Tracker returned an empty record" };
       const f = mapOpportunity(opp);
       if (!f.title) return { id, error: "no advert title on this record" };
 
@@ -168,7 +173,8 @@ export async function GET(req) {
     } catch (e) {
       return { id, error: String((e && e.message) || e) };
     }
-  }));
+    })());
+  }
 
   // One id: hand back the image itself, so the link can be shared or saved
   // directly rather than going through a page.
