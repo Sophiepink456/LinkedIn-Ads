@@ -1,6 +1,8 @@
 import { mapOpportunity } from "../../../lib/mapping";
-import { COMPETITIVE_LABEL } from "../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision,
+  recipientsFor, dedupeKeyFor } from "../../../lib/config";
 import { getOpportunity } from "../../../lib/tracker";
+import { seen, kvConfigured } from "../../../lib/kv";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -16,8 +18,29 @@ export const dynamic = "force-dynamic";
 // ?dry=1 answers the same question in JSON, with the recipients and the
 // reasons a job was skipped; this is for when you just want to see the image.
 //
+// Each advert carries a verdict: whether the webhook would send it, whether
+// it is already recorded as sent, or why it is blocked — so several jobs can
+// be answered with one link instead of a dry run each.
+//
 // ?hide_salary=1 renders the "Competitive" version instead.
 // ---------------------------------------------------------------------------
+
+const ADVERTS_PUBLISHED_FROM = process.env.ADVERTS_PUBLISHED_FROM || "2026-09-01";
+
+// Why would this job NOT produce an advert? Mirrors the webhook's checks.
+function blockers(f) {
+  const out = [];
+  if (!f.advertised) out.push("advertStatus is not A — not advertised");
+  if (f.dead) out.push("status is " + (f.status || "(none)") + " — not advertising");
+  if (!f.title) out.push("no advert title");
+  if (isExcludedDepartment(f.department)) out.push("excluded department: " + f.department);
+  if (isTestRecord(f.title, f.client)) out.push("test or training record");
+  if (String(f.publishDate || "").slice(0, 10) < ADVERTS_PUBLISHED_FROM) {
+    out.push("published " + (String(f.publishDate || "").slice(0, 10) || "(no date)") +
+      ", before the " + ADVERTS_PUBLISHED_FROM + " cut-off");
+  }
+  return out;
+}
 
 const MAX_IDS = 24;
 
@@ -57,7 +80,18 @@ function page(cards) {
       : '<figure class="card"><a href="' + escapeHtml(c.src) + '" download><img src="' +
         escapeHtml(c.src) + '" alt="' + escapeHtml(c.title) + '" loading="lazy"></a>' +
         "<figcaption><b>" + escapeHtml(c.id) + "</b> " + escapeHtml(c.title) +
-        '<span class="sub">' + escapeHtml(c.sub) + "</span></figcaption></figure>"
+        '<span class="sub">' + escapeHtml(c.sub) + "</span>" +
+        '<span class="v ' + (c.verdict === "would send" ? "good" : c.verdict === "blocked" ? "bad" : "warn") +
+          '">' + escapeHtml(c.verdict) + "</span>" +
+        (c.skipped && c.skipped.length
+          ? '<span class="sub">' + escapeHtml(c.skipped.join("; ")) + "</span>" : "") +
+        (c.emailTo ? '<span class="sub">To: ' + escapeHtml(c.emailTo) + "</span>" : "") +
+        (c.emailCc ? '<span class="sub">Cc: ' + escapeHtml(c.emailCc) + "</span>" : "") +
+        (c.noAddressOnFile
+          ? '<span class="sub bad">no address on file: ' + escapeHtml(c.noAddressOnFile) + "</span>" : "") +
+        (c.verdict !== "would send" && c.resend
+          ? '<a class="btn" href="' + escapeHtml(c.resend) + '">Send it now</a>' : "") +
+        "</figcaption></figure>"
   )).join("\n");
   return '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
@@ -73,9 +107,15 @@ function page(cards) {
     "figcaption{margin-top:10px;font-size:14px}" +
     ".sub{display:block;color:#9a9a9a;font-size:13px}" +
     ".bad .err{padding:24px;border:1px solid #4a3030;border-radius:8px;color:#ff9b9b;font-size:14px}" +
+    ".v{display:inline-block;margin-top:6px;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}" +
+    ".v.good{background:#1d3a1d;color:#9be89b}.v.warn{background:#4a3f1d;color:#f0d78a}" +
+    ".v.bad{background:#4a2020;color:#ff9b9b}" +
+    "span.sub.bad{color:#ff9b9b}" +
+    ".btn{display:inline-block;margin-top:8px;padding:6px 14px;border-radius:6px;" +
+    "background:#BAE400;color:#161616;font-size:13px;font-weight:600}" +
     "a{color:inherit;text-decoration:none}" +
     "</style></head><body><h1>Adverts</h1>" +
-    '<p class="lead">Click an advert to download it. Nothing here has been emailed.</p>' +
+    '<p class="lead">Click an advert to download it. Nothing here has been emailed — the verdict says what the webhook would do.</p>' +
     '<div class="grid">' + body + "</div></body></html>";
 }
 
@@ -100,7 +140,24 @@ export async function GET(req) {
       if (!opp) return { id, error: "not found in Tracker" };
       const f = mapOpportunity(opp);
       if (!f.title) return { id, error: "no advert title on this record" };
+
+      const division = resolveDivision(f.department, f.consultant);
+      const skipped = blockers(f);
+      let alreadySent = null;
+      if (!skipped.length && kvConfigured()) {
+        try { alreadySent = await seen(dedupeKeyFor(f, division)); } catch { alreadySent = null; }
+      }
+      const recipients = recipientsFor({ ...f, division });
+
       return {
+        verdict: skipped.length ? "blocked"
+          : alreadySent === true ? "already recorded as sent"
+          : "would send",
+        skipped,
+        emailTo: recipients.to.join(", "),
+        emailCc: recipients.cc.join(", "),
+        noAddressOnFile: recipients.missing.join(", "),
+        resend: url.origin + "/api/tracker-hook?id=" + id + "&force=1" + (token ? "&token=" + token : ""),
         id,
         title: f.title,
         // Say what the real send would have made of it, without acting on it.
