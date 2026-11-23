@@ -1,6 +1,6 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor, dedupeKeyFor } from "../../../lib/config";
-import { getOpportunity } from "../../../lib/tracker";
+import { getOpportunityResult } from "../../../lib/tracker";
 import { claim, release, seen, kvConfigured, nextSequence } from "../../../lib/kv";
 
 export const runtime = "edge";
@@ -158,13 +158,34 @@ async function handle(req, body) {
     return ok({ ok: true, skipped: "no record id found in payload", received: body });
   }
 
-  let opp;
-  try {
-    opp = await getOpportunity(recordId);
-  } catch (e) {
-    return ok({ ok: false, id: recordId, error: String((e && e.message) || e) });
+  // A rejected look-up used to be reported as "record not found", which is
+  // the same lie the preview page told: the advert was dropped silently and
+  // the job looked like it simply did not exist. Tracker invalidates the
+  // previous token on every exchange, so a burst of pings can leave one
+  // instance holding a dead token — worth retrying before giving up.
+  let result;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      result = await getOpportunityResult(recordId);
+    } catch (e) {
+      result = { ok: false, status: 0, data: null, reason: String((e && e.message) || e) };
+    }
+    if (result.ok || result.status === 404) break;
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
   }
 
+  if (!result.ok && result.status !== 404) {
+    // ok:false so this shows as a failure rather than a quiet skip. Nothing
+    // has been claimed, so the next ping on this job will try again.
+    return ok({
+      ok: false,
+      id: recordId,
+      error: "could not read the job from Tracker: " + result.reason,
+      note: "No advert was sent and nothing was recorded, so this job is not marked as done.",
+    }, 200);
+  }
+
+  const opp = result.data;
   if (!opp) return ok({ ok: true, id: recordId, skipped: "record not found" });
 
   const f = mapOpportunity(opp);
