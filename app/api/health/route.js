@@ -25,6 +25,34 @@ export const dynamic = "force-dynamic";
 
 const AUTH_PATH = "/api/Auth/ExchangeToken";
 
+// A JWT's payload is base64url, not encrypted, so the token can say for itself
+// when it was issued and when it expires. Tracker reported a freshly issued
+// token as "expired at 19/11/2026 15:56", which only its own claims can
+// settle: either it is handing back a stale token, or it is issuing one dated
+// in the past. No signature check here — this is a report, not a gate.
+function jwtClaims(jwt) {
+  try {
+    const part = String(jwt).split(".")[1];
+    if (!part) return null;
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const json = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+    const c = JSON.parse(json);
+    const when = (v) => (typeof v === "number" ? new Date(v * 1000).toISOString() : undefined);
+    const now = Date.now() / 1000;
+    return {
+      issuedAt: when(c.iat),
+      notBefore: when(c.nbf),
+      expiresAt: when(c.exp),
+      alreadyExpired: typeof c.exp === "number" ? c.exp < now : undefined,
+      secondsOfLifeLeft: typeof c.exp === "number" ? Math.round(c.exp - now) : undefined,
+      issuer: c.iss,
+      audience: c.aud,
+    };
+  } catch (e) {
+    return { couldNotDecode: String((e && e.message) || e) };
+  }
+}
+
 function describe(secret) {
   const s = String(secret == null ? "" : secret);
   if (!s) return { present: false };
@@ -94,6 +122,7 @@ export async function GET(req) {
       jwt = text.trim();
     }
     out.exchange.tokenTheCodePicksUp = describe(jwt);
+    if (jwt) out.exchange.whatTheTokenSaysAboutItself = jwtClaims(jwt);
   } catch (e) {
     out.exchange = { threw: String((e && e.message) || e) };
   }
@@ -135,6 +164,16 @@ export async function GET(req) {
     } catch (e) {
       out.searchInstead = { threw: String((e && e.message) || e) };
     }
+  }
+
+  const claims = out.exchange && out.exchange.whatTheTokenSaysAboutItself;
+  if (claims && claims.alreadyExpired) {
+    out.readThis = "Tracker issued a token that was ALREADY EXPIRED when it handed it over" +
+      (claims.expiresAt ? " (expired " + claims.expiresAt + ")" : "") +
+      ". Nothing in this code can work around that: the API credential needs reissuing in Tracker.";
+    return new Response(JSON.stringify(out, null, 2), {
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
   }
 
   out.readThis =
