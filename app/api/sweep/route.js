@@ -2,7 +2,7 @@ import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision,
   recipientsFor, dedupeKeyFor } from "../../../lib/config";
 import { seen, kvConfigured } from "../../../lib/kv";
-import { getOpportunityResult, pagedSearch } from "../../../lib/tracker";
+import { getOpportunityResult, pagedSearch, getJwt, tokenLife } from "../../../lib/tracker";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -211,18 +211,47 @@ export async function GET(req) {
     noAddressOnFile: jobs.filter((j) => j.noAddressOnFile).length,
   };
 
-  const summary =
-    shown.length === 0
+  // ---- How long has the Tracker token got? ----
+  // Tracker issues a token with a SEVEN DAY life and then keeps handing back
+  // that same token. It does not mint a new one when it expires: on 24
+  // November it was still returning one that had died on the 19th, and the
+  // only way out was to regenerate the API key. So the expiry date is a
+  // deadline, and it belongs somewhere Sophie sees it every day rather than
+  // being discovered when adverts stop.
+  const tracker = {};
+  try {
+    const life = tokenLife(await getJwt());
+    if (life) {
+      const days = life.secondsLeft / 86400;
+      tracker.tokenExpiresAt = life.expiresAt;
+      tracker.daysLeft = Math.round(days * 10) / 10;
+      if (days < 3) {
+        tracker.warning =
+          "The Tracker token expires " + life.expiresAt + " (" + tracker.daysLeft + " days). " +
+          "Tracker does not issue a new one on its own — regenerate the API key in Tracker and " +
+          "update TRACKER_BEARER_TOKEN in Vercel, or adverts will stop.";
+      }
+    }
+  } catch (e) {
+    tracker.error = String((e && e.message) || e);
+  }
+
+  const alert = tracker.warning ? "** " + tracker.warning + " **\n\n"
+    : tracker.error ? "** Tracker is not answering: " + tracker.error + " **\n\n" : "";
+
+  const summary = alert +
+    (shown.length === 0
       ? "Nothing to report in the last " + days + " days."
       : shown.length + " advert(s) published in the last " + days + " days  (" +
         counts.wouldSend + " would send, " + counts.alreadySent + " already recorded as sent, " +
-        counts.blocked + " blocked):\n\n" + lines.join("\n\n");
+        counts.blocked + " blocked):\n\n" + lines.join("\n\n"));
 
   return new Response(JSON.stringify({
     generatedAt: new Date().toISOString(),
     publishedOnOrAfter: cutoff,
     couldNotRead: failed,
     memory: kvConfigured() ? "connected" : "NOT CONFIGURED — nothing is being de-duplicated",
+    tracker,
     counts,
     count: shown.length,
     summary,
