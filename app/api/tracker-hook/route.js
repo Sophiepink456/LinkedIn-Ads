@@ -1,7 +1,8 @@
 import { mapOpportunity } from "../../../lib/mapping";
-import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor, dedupeKeyFor } from "../../../lib/config";
+import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision, recipientsFor,
+  dedupeKeyFor, lastSentKeyFor, LAST_SENT_TTL_S } from "../../../lib/config";
 import { getOpportunityResult } from "../../../lib/tracker";
-import { claim, release, seen, kvConfigured, nextSequence } from "../../../lib/kv";
+import { claim, release, seen, kvConfigured, nextSequence, kvSet, kvGet } from "../../../lib/kv";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -230,16 +231,45 @@ async function handle(req, body) {
     // real advert later. ?force=1 makes the key deliberately unique, so the
     // check uses the plain key the webhook would actually have claimed.
     let alreadySent = null;
+    let lastSent = null;
     if (kvConfigured()) {
       const division = resolveDivision(f.department, f.consultant);
       try { alreadySent = await seen(dedupeKeyFor(f, division)); } catch { alreadySent = null; }
+      // What did the last advert for this job actually go out for? A publish
+      // date older than the job's current one means it has been re-advertised
+      // since, and if nothing on the advert changed the de-duplication key is
+      // identical, so the webhook skipped it without a word. That is what
+      // happened to job 45223 and it is the question this endpoint gets asked.
+      try {
+        const raw = await kvGet(lastSentKeyFor(f.id));
+        if (raw) { try { lastSent = JSON.parse(raw); } catch { lastSent = null; } }
+      } catch { lastSent = null; }
     }
+
+    const publishDate = String(f.publishDate || "").slice(0, 10);
+    const lastFor = lastSent ? String(lastSent.publishDate || "").slice(0, 10) : "";
+    const reAdvertised = !!(alreadySent === true && lastFor && publishDate > lastFor);
+
     return ok({
       ok: true,
       dryRun: true,
       alreadySent,
-      verdict: alreadySent === true
-        ? "already recorded as sent — the webhook would skip this. If the email never arrived, re-send with the link below."
+      reAdvertised,
+      lastAdvertSentFor: lastFor || null,
+      lastAdvertSentAt: lastSent ? String(lastSent.sentAt || "").slice(0, 10) || null : null,
+      verdict: reAdvertised
+        ? "RE-ADVERTISED AND SKIPPED. The last advert went out on " +
+          (String((lastSent && lastSent.sentAt) || "").slice(0, 10) || "an unknown date") +
+          " for publish date " + lastFor + ", and this job now shows " + publishDate +
+          ". Nothing on the advert itself changed, so it produced the same de-duplication key" +
+          " and the webhook treated it as a repeat. Use the link below to send it."
+        : alreadySent === true
+          ? "already recorded as sent — the webhook would skip this." +
+            (lastFor
+              ? " The last advert went out for publish date " + lastFor + ", which matches this one."
+              : " There is no record of WHICH advert went out (it predates that being kept), so a" +
+                " re-advertise cannot be ruled out here — check the Sent folder.") +
+            " If the email never arrived, re-send with the link below."
         : alreadySent === false
           ? "not in the memory — the webhook would send this advert"
           : "memory not checked (not configured, or unreachable)",
@@ -284,6 +314,23 @@ async function handle(req, body) {
   // instead of the job being marked done and going quiet for good.
   if (!forwarded.ok && !force && kvConfigured()) {
     try { await release(payload.dedupeKey); } catch { /* nothing useful to do */ }
+  }
+
+  // Record WHAT was advertised, not just that something was. The dedupe key
+  // cannot tell a job re-advertised unchanged from one nobody has touched, so
+  // the publish date this advert went out for is kept separately and the sweep
+  // compares it against the job's current one. Written after the send, so a
+  // failed send leaves no trace claiming otherwise. Reporting only — a failure
+  // here must never cost an advert that has already gone out.
+  if (forwarded.ok && kvConfigured()) {
+    try {
+      await kvSet(lastSentKeyFor(f.id), JSON.stringify({
+        publishDate: String(f.publishDate || "").slice(0, 10),
+        sentAt: new Date().toISOString(),
+        title: f.title,
+        forced: !!force,
+      }), LAST_SENT_TTL_S);
+    } catch { /* the advert is out; this is only the record of it */ }
   }
 
   return ok({ ok: true, id: recordId, title: f.title, sent: forwarded.ok, forwarded });

@@ -1,8 +1,8 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision,
-  recipientsFor, dedupeKeyFor } from "../../../lib/config";
+  recipientsFor, dedupeKeyFor, lastSentKeyFor } from "../../../lib/config";
 import { getOpportunityResult } from "../../../lib/tracker";
-import { seen, kvConfigured } from "../../../lib/kv";
+import { seen, kvConfigured, kvGet } from "../../../lib/kv";
 
 export const runtime = "edge";
 export const dynamic = "force-dynamic";
@@ -85,6 +85,7 @@ function page(cards) {
           '">' + escapeHtml(c.verdict) + "</span>" +
         (c.skipped && c.skipped.length
           ? '<span class="sub">' + escapeHtml(c.skipped.join("; ")) + "</span>" : "") +
+        (c.note ? '<span class="sub">' + escapeHtml(c.note) + "</span>" : "") +
         (c.emailTo ? '<span class="sub">To: ' + escapeHtml(c.emailTo) + "</span>" : "") +
         (c.emailCc ? '<span class="sub">Cc: ' + escapeHtml(c.emailCc) + "</span>" : "") +
         (c.noAddressOnFile
@@ -149,15 +150,36 @@ export async function GET(req) {
       const division = resolveDivision(f.department, f.consultant);
       const skipped = blockers(f);
       let alreadySent = null;
+      let lastSent = null;
       if (!skipped.length && kvConfigured()) {
         try { alreadySent = await seen(dedupeKeyFor(f, division)); } catch { alreadySent = null; }
+        try {
+          const raw = await kvGet(lastSentKeyFor(f.id));
+          if (raw) { try { lastSent = JSON.parse(raw); } catch { lastSent = null; } }
+        } catch { lastSent = null; }
       }
+
+      // A job re-advertised with identical details produces the identical
+      // de-duplication key, so the webhook skips it and says nothing. The
+      // publish date the last advert went out for is the only thing that
+      // gives it away.
+      const publishDate = String(f.publishDate || "").slice(0, 10);
+      const lastFor = lastSent ? String(lastSent.publishDate || "").slice(0, 10) : "";
+      const reAdvertised = !!(alreadySent === true && lastFor && publishDate > lastFor);
+
       const recipients = recipientsFor({ ...f, division });
 
       return {
         verdict: skipped.length ? "blocked"
+          : reAdvertised ? "re-advertised — skipped in silence"
           : alreadySent === true ? "already recorded as sent"
           : "would send",
+        note: reAdvertised
+          ? "The last advert went out " + (String((lastSent && lastSent.sentAt) || "").slice(0, 10) || "(unknown)") +
+            " for publish date " + lastFor + "; this job now shows " + publishDate + "."
+          : alreadySent === true && !lastFor
+            ? "No record of which advert went out — it predates that being kept, so a re-advertise cannot be ruled out here."
+            : "",
         skipped,
         emailTo: recipients.to.join(", "),
         emailCc: recipients.cc.join(", "),

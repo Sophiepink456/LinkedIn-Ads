@@ -1,7 +1,7 @@
 import { mapOpportunity } from "../../../lib/mapping";
 import { COMPETITIVE_LABEL, isExcludedDepartment, isTestRecord, resolveDivision,
-  recipientsFor, dedupeKeyFor } from "../../../lib/config";
-import { seen, kvConfigured } from "../../../lib/kv";
+  recipientsFor, dedupeKeyFor, lastSentKeyFor } from "../../../lib/config";
+import { seen, kvConfigured, kvMGet } from "../../../lib/kv";
 import { getOpportunityResult, pagedSearch, getJwt, tokenLife } from "../../../lib/tracker";
 
 export const runtime = "edge";
@@ -136,6 +136,24 @@ export async function GET(req) {
     .map((opp) => mapOpportunity(opp))
     .sort((a, b) => String(b.publishDate).localeCompare(String(a.publishDate)));
 
+  // ---- What did we last advertise for each of these jobs? ----
+  // One request for the lot. A job whose publish date has moved on since the
+  // advert we sent has been re-advertised, and if its details did not change
+  // the de-duplication key is identical and the webhook skipped it in silence
+  // — job 45223, advertised 6 October and re-published 24 November, is the
+  // case that found this. No record exists for adverts sent before this was
+  // added, so those read as "unknown" rather than as a clean bill of health.
+  const lastSentFor = {};
+  if (kvConfigured() && mapped.length) {
+    try {
+      const values = await kvMGet(mapped.map((f) => lastSentKeyFor(f.id)));
+      mapped.forEach((f, i) => {
+        if (!values[i]) return;
+        try { lastSentFor[f.id] = JSON.parse(values[i]); } catch { /* unreadable */ }
+      });
+    } catch { /* reporting only — the sweep still works without it */ }
+  }
+
   const jobs = await Promise.all(mapped
     .map(async (f) => {
       const division = resolveDivision(f.department, f.consultant);
@@ -147,6 +165,16 @@ export async function GET(req) {
       if (!skipped.length && kvConfigured()) {
         try { alreadySent = await seen(dedupeKeyFor(f, division)); } catch { alreadySent = null; }
       }
+
+      // Re-advertised since the advert we sent? Only meaningful for a job the
+      // store says is already done — that is precisely the case where nothing
+      // else would ever mention it again.
+      const publishDate = String(f.publishDate).slice(0, 10);
+      const lastSent = lastSentFor[f.id] || null;
+      const reAdvertised = !!(
+        alreadySent === true && lastSent && lastSent.publishDate &&
+        publishDate > String(lastSent.publishDate).slice(0, 10)
+      );
 
       const recipients = recipientsFor({ ...f, division });
 
@@ -176,12 +204,18 @@ export async function GET(req) {
         client: f.client,
         status: f.status,
         department: f.department,
-        publishDate: String(f.publishDate).slice(0, 10),
+        publishDate,
         verdict: skipped.length ? "blocked"
+          : reAdvertised ? "re-advertised since the last advert"
           : alreadySent === true ? "already recorded as sent"
           : "would send",
         skipped,
         alreadySent,
+        reAdvertised,
+        // Null for anything advertised before this record was kept, which is
+        // honest: it means we cannot tell, not that nothing has changed.
+        lastAdvertSentFor: lastSent ? String(lastSent.publishDate || "") || null : null,
+        lastAdvertSentAt: lastSent ? String(lastSent.sentAt || "").slice(0, 10) || null : null,
         emailTo: recipients.to.join(", "),
         emailCc: recipients.cc.join(", "),
         noAddressOnFile: recipients.missing.join(", "),
@@ -202,10 +236,14 @@ export async function GET(req) {
     : only === "blocked" ? jobs.filter((j) => j.verdict === "blocked")
     : only === "unsent" || only === "would-send" ? jobs.filter((j) => j.verdict === "would send")
     : only === "sent" ? jobs.filter((j) => j.verdict === "already recorded as sent")
+    : only === "readvertised" || only === "re-advertised" ? jobs.filter((j) => j.reAdvertised)
     : jobs;
 
-  // Never sent comes first: it is the only category with work attached.
-  const rank = (v) => (v === "would send" ? 0 : v === "blocked" ? 1 : 2);
+  // The two categories with work attached come first: an advert that has
+  // never gone out, then one for a job that has been re-advertised since.
+  const rank = (v) => (v === "would send" ? 0
+    : v === "re-advertised since the last advert" ? 1
+    : v === "blocked" ? 2 : 3);
   shown.sort((a, b) => rank(a.verdict) - rank(b.verdict) ||
     String(b.publishDate).localeCompare(String(a.publishDate)));
 
@@ -219,6 +257,16 @@ export async function GET(req) {
         "\n    To: " + (j.emailTo || "(nobody)") +
         "\n    With salary:  " + j.imageUrl;
     }
+    if (j.verdict === "re-advertised since the last advert") {
+      return head +
+        "\n    RE-ADVERTISED AND SKIPPED. The last advert went out " +
+        (j.lastAdvertSentAt || "(unknown)") + " for publish date " +
+        (j.lastAdvertSentFor || "(unknown)") + "; this job now shows " + j.publishDate +
+        ", and nothing on the advert itself changed, so the webhook treated it as a" +
+        " repeat and said nothing. Send it: " + j.resend +
+        "\n    To: " + (j.emailTo || "(nobody)") +
+        "\n    With salary:  " + j.imageUrl;
+    }
     const bits = [head, "    To: " + (j.emailTo || "(nobody)")];
     if (j.noAddressOnFile) bits.push("    NO ADDRESS ON FILE: " + j.noAddressOnFile);
     if (j.alreadySent) bits.push("    Already recorded as sent. If it never arrived, re-send: " + j.resend);
@@ -229,9 +277,14 @@ export async function GET(req) {
 
   const counts = {
     wouldSend: jobs.filter((j) => j.verdict === "would send").length,
+    reAdvertised: jobs.filter((j) => j.reAdvertised).length,
     alreadySent: jobs.filter((j) => j.verdict === "already recorded as sent").length,
     blocked: jobs.filter((j) => j.verdict === "blocked").length,
     noAddressOnFile: jobs.filter((j) => j.noAddressOnFile).length,
+    // Adverts that went out before this record was kept. Not a problem, but
+    // they cannot be checked for re-advertising, so the number matters when
+    // reading reAdvertised as "the full list".
+    noLastAdvertRecord: jobs.filter((j) => j.alreadySent === true && !j.lastAdvertSentFor).length,
   };
 
   // ---- How long has the Tracker token got? ----
@@ -266,7 +319,8 @@ export async function GET(req) {
     (shown.length === 0
       ? "Nothing to report in the last " + days + " days."
       : shown.length + " advert(s) published in the last " + days + " days  (" +
-        counts.wouldSend + " would send, " + counts.alreadySent + " already recorded as sent, " +
+        counts.wouldSend + " would send, " + counts.reAdvertised + " re-advertised and skipped, " +
+        counts.alreadySent + " already recorded as sent, " +
         counts.blocked + " blocked):\n\n" + lines.join("\n\n"));
 
   return new Response(JSON.stringify({

@@ -53,6 +53,51 @@ function jwtClaims(jwt) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Does Tracker carry a field that marks the ADVERT being refreshed, as
+// opposed to the record being saved?
+//
+// This matters because advertDetails.publishDate does not. Tracker bumps it
+// whenever a record with advertStatus "A" is saved — 55 of 291 updated
+// records across a two-day sample — so keying adverts on it would email about
+// 27 a day for jobs nobody re-advertised. But without SOME signal, a job
+// re-advertised with identical details produces an identical de-duplication
+// key and is skipped in silence, which is what happened to job 45223.
+//
+// So: list every date-ish field on the record, by path, and let a human look.
+// Deliberately narrow — field names and date-shaped values only, never
+// arbitrary values, because the record also holds client contact details.
+const DATEISH_NAME = /date|publish|advert|modif|updat|creat|refresh|renew|post|live|expir/i;
+const DATEISH_VALUE = /^\d{4}-\d{2}-\d{2}([T ]|$)|^\d{1,2}\/\d{1,2}\/\d{4}/;
+
+function dateFields(obj, prefix, out, depth) {
+  if (!obj || typeof obj !== "object" || depth > 3) return out;
+  for (const [k, v] of Object.entries(obj)) {
+    const path = prefix ? prefix + "." + k : k;
+    if (v && typeof v === "object") {
+      if (Array.isArray(v)) {
+        // Arrays of objects (history rows, advert postings) are where a real
+        // "advertised on" event would hide, so look at the first entry.
+        if (v.length && typeof v[0] === "object") dateFields(v[0], path + "[0]", out, depth + 1);
+        else out[path] = "(array of " + v.length + ")";
+      } else {
+        dateFields(v, path, out, depth + 1);
+      }
+      continue;
+    }
+    const looksDate = typeof v === "string" && DATEISH_VALUE.test(v);
+    if (looksDate) { out[path] = v; continue; }
+    // A named-but-empty date field still tells us the field EXISTS, which is
+    // the whole question. Non-date values are reported as a type only.
+    if (DATEISH_NAME.test(k)) {
+      out[path] = v == null || v === "" ? "(empty)"
+        : typeof v === "string" && v.length <= 24 ? v
+        : "(" + typeof v + ")";
+    }
+  }
+  return out;
+}
+
 function describe(secret) {
   const s = String(secret == null ? "" : secret);
   if (!s) return { present: false };
@@ -140,9 +185,26 @@ export async function GET(req) {
         ok: res.ok,
         // The body of a 401 usually says WHY — expired, wrong audience,
         // subscription lapsed, IP not allowed. That is the missing piece.
-        body: text.slice(0, 500),
+        body: res.ok ? "(suppressed — ?fields=1 for the date fields)" : text.slice(0, 500),
         wwwAuthenticate: res.headers.get("www-authenticate"),
       };
+
+      // ?fields=1 — which date fields does this record actually carry?
+      if (res.ok && url.searchParams.get("fields") === "1") {
+        try {
+          const rec = JSON.parse(text);
+          const body = (rec && (rec.data || rec.opportunity)) || rec;
+          out.dateFieldsOnThisRecord = dateFields(body, "", {}, 0);
+          out.topLevelKeys = body && typeof body === "object" ? Object.keys(body) : null;
+          out.readThisAboutFields =
+            "Looking for a field that moves when a consultant RE-ADVERTISES, and does not move" +
+            " when the record is merely saved. advertDetails.publishDate is known to move on" +
+            " every save, so it cannot be used. If nothing else here fits, the sweep's" +
+            " re-advertised report is the answer rather than an automatic send.";
+        } catch (e) {
+          out.dateFieldsOnThisRecord = { error: String((e && e.message) || e) };
+        }
+      }
     } catch (e) {
       out.lookup = { id, threw: String((e && e.message) || e) };
     }
