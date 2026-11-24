@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { SECTORS, BACKGROUNDS } from "../lib/config";
 
 const GREEN = "#93BF20";
@@ -18,6 +18,31 @@ export default function Home() {
   const [image, setImage] = useState("auto");
   const [previewUrl, setPreviewUrl] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // "Why hasn't this job come through?" — the question that gets asked most.
+  // Answering it used to mean someone hand-building an /api/ad URL with the
+  // token pasted on the end, every single time.
+  const [lookupIds, setLookupIds] = useState("");
+  const [lookupToken, setLookupToken] = useState("");
+
+  // The token is remembered in this browser only, so it is typed once rather
+  // than pasted into a chat window each time it is needed.
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("adToken");
+      if (saved) setLookupToken(saved);
+    } catch { /* private browsing — just means typing it again */ }
+  }, []);
+
+  function handleLookup() {
+    const ids = lookupIds.split(/[^0-9]+/).filter(Boolean).join(",");
+    if (!ids) return;
+    try {
+      if (lookupToken) window.localStorage.setItem("adToken", lookupToken);
+    } catch { /* nothing worth failing over */ }
+    const q = "ids=" + ids + (lookupToken ? "&token=" + encodeURIComponent(lookupToken) : "");
+    window.open("/api/ad?" + q, "_blank");
+  }
 
   function buildUrl() {
     const p = new URLSearchParams();
@@ -64,6 +89,36 @@ export default function Home() {
     <main style={{ maxWidth: "1000px", margin: "0 auto", padding: "40px 24px 80px" }}>
       <h1 style={{ fontSize: "28px", margin: "0 0 4px" }}>Elevation Ad Generator</h1>
       <p style={{ margin: "0 0 28px", color: "#5a636c" }}>Fill this in, click <strong>Generate preview</strong>, then download.</p>
+
+      <section style={{ margin: "0 0 32px", padding: "18px 20px", border: "1px solid #d5dae0", borderRadius: "12px", background: "#f7f9fa" }}>
+        <h2 style={{ fontSize: "16px", margin: "0 0 4px" }}>Why hasn&rsquo;t a job come through?</h2>
+        <p style={{ margin: "0 0 12px", color: "#5a636c", fontSize: "14px" }}>
+          Tracker job numbers, separated by spaces or commas. Shows the advert for each one and whether it would send,
+          has already been recorded as sent, or is blocked &mdash; with a button to send it. Nothing is emailed by looking.
+        </p>
+        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+          <input
+            style={{ ...field, flex: "2 1 260px", width: "auto" }}
+            value={lookupIds}
+            onChange={(e) => setLookupIds(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") handleLookup(); }}
+            placeholder="e.g. 45223, 45698"
+            inputMode="numeric"
+          />
+          <input
+            style={{ ...field, flex: "1 1 170px", width: "auto" }}
+            value={lookupToken}
+            onChange={(e) => setLookupToken(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") handleLookup(); }}
+            placeholder="Access token"
+            type="password"
+          />
+          <button
+            onClick={handleLookup}
+            style={{ padding: "11px 22px", fontSize: "15px", fontWeight: 600, borderRadius: "10px", border: "none", background: GREEN, color: "#fff", cursor: "pointer" }}
+          >Check</button>
+        </div>
+      </section>
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(340px, 1fr) minmax(300px, 420px)", gap: "36px", alignItems: "start" }}>
         <div>
