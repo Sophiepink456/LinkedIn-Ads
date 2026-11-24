@@ -191,16 +191,34 @@ export async function GET(req) {
       };
     }));
 
-  const only = url.searchParams.get("verdict");
-  const shown = only === "blocked"
-    ? jobs.filter((j) => j.verdict !== "would send")
+  // ?verdict= narrows the report. "blocked" used to mean "everything except
+  // would send", which hid the one category that actually needs acting on:
+  // a job published days ago that has never been sent at all. Sophie ran it
+  // during the outage and the ten missing adverts were filtered out of her
+  // own report.
+  const only = (url.searchParams.get("verdict") || "").toLowerCase();
+  const shown =
+    only === "missing" ? jobs.filter((j) => j.verdict !== "already recorded as sent")
+    : only === "blocked" ? jobs.filter((j) => j.verdict === "blocked")
+    : only === "unsent" || only === "would-send" ? jobs.filter((j) => j.verdict === "would send")
+    : only === "sent" ? jobs.filter((j) => j.verdict === "already recorded as sent")
     : jobs;
+
+  // Never sent comes first: it is the only category with work attached.
+  const rank = (v) => (v === "would send" ? 0 : v === "blocked" ? 1 : 2);
+  shown.sort((a, b) => rank(a.verdict) - rank(b.verdict) ||
+    String(b.publishDate).localeCompare(String(a.publishDate)));
 
   // A ready-made email body, so the Zap can just drop it into Gmail.
   const lines = shown.map((j) => {
     const head = j.publishDate + "  —  " + j.title + "  —  " + j.consultant +
       " (" + (j.division || "no division") + ")  [" + j.verdict + "]";
     if (j.verdict === "blocked") return head + "\n    " + j.skipped.join("\n    ");
+    if (j.verdict === "would send") {
+      return head + "\n    NO ADVERT HAS BEEN SENT FOR THIS JOB. Send it: " + j.resend +
+        "\n    To: " + (j.emailTo || "(nobody)") +
+        "\n    With salary:  " + j.imageUrl;
+    }
     const bits = [head, "    To: " + (j.emailTo || "(nobody)")];
     if (j.noAddressOnFile) bits.push("    NO ADDRESS ON FILE: " + j.noAddressOnFile);
     if (j.alreadySent) bits.push("    Already recorded as sent. If it never arrived, re-send: " + j.resend);
