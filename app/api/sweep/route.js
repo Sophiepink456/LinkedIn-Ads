@@ -36,7 +36,8 @@ export const dynamic = "force-dynamic";
 const ADVERTS_PUBLISHED_FROM = process.env.ADVERTS_PUBLISHED_FROM || "2026-09-01";
 
 const LOOKBACK_DAYS = 2;      // adverts published within this window
-const TRAWL_DAYS = 7;         // how far back to search for candidates
+const TRAWL_DAYS = 7;         // minimum window to search for candidates
+const MAX_TRAWL_DAYS = 45;    // a ceiling, so one link cannot trawl the year
 const MAX_PAGES = 40;
 const MAX_DETAILS = 120;
 // Tracker invalidates the previous token every time a new one is issued, so
@@ -97,7 +98,11 @@ export async function GET(req) {
 
   let shallow;
   try {
-    shallow = await fetchAllPages({ state: "open", updatedAfter: daysAgoISO(TRAWL_DAYS) });
+    // The candidate search has to reach at least as far back as the report
+    // does, or ?days=10 quietly reports on a 7-day trawl and the older jobs
+    // it is being asked about are never even looked at.
+    const trawl = Math.min(MAX_TRAWL_DAYS, Math.max(TRAWL_DAYS, days + 1));
+    shallow = await fetchAllPages({ state: "open", updatedAfter: daysAgoISO(trawl) });
   } catch (e) {
     return new Response(JSON.stringify({ error: String((e && e.message) || e) }, null, 2), {
       status: 502, headers: { "content-type": "application/json" },
@@ -249,6 +254,7 @@ export async function GET(req) {
   return new Response(JSON.stringify({
     generatedAt: new Date().toISOString(),
     publishedOnOrAfter: cutoff,
+    searchedBackTo: daysAgoISO(Math.min(MAX_TRAWL_DAYS, Math.max(TRAWL_DAYS, days + 1))),
     couldNotRead: failed,
     memory: kvConfigured() ? "connected" : "NOT CONFIGURED — nothing is being de-duplicated",
     tracker,
