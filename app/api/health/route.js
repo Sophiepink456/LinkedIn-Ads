@@ -196,6 +196,24 @@ export async function GET(req) {
           const body = (rec && (rec.data || rec.opportunity)) || rec;
           out.dateFieldsOnThisRecord = dateFields(body, "", {}, 0);
           out.topLevelKeys = body && typeof body === "object" ? Object.keys(body) : null;
+
+          // Custom fields are the one place the walk above cannot see
+          // properly: Tracker returns them as rows of {name, value}, so the
+          // KEY is always "name" and only the first row gets walked. If the
+          // business keeps its own "date advertised" anywhere, it is here, and
+          // missing it would mean concluding "no such field exists" from an
+          // incomplete look. Names always; values only when date-shaped.
+          const cf = body && body.customFields;
+          const rows = Array.isArray(cf) ? cf : cf && typeof cf === "object" ? Object.entries(cf).map(([k, v]) => ({ name: k, value: v })) : [];
+          out.customFieldsOnThisRecord = rows.slice(0, 80).map((r) => {
+            const name = String((r && (r.name || r.fieldName || r.label)) || "(unnamed)");
+            const value = r && (r.value !== undefined ? r.value : r.fieldValue);
+            const dateShaped = typeof value === "string" && DATEISH_VALUE.test(value);
+            return dateShaped ? name + " = " + value
+              : DATEISH_NAME.test(name)
+                ? name + " = " + (value == null || value === "" ? "(empty)" : "(" + typeof value + ")")
+                : name;
+          });
           out.readThisAboutFields =
             "Looking for a field that moves when a consultant RE-ADVERTISES, and does not move" +
             " when the record is merely saved. advertDetails.publishDate is known to move on" +
